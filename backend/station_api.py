@@ -1,0 +1,1003 @@
+"""Station registry and onboarding endpoints."""
+from __future__ import annotations
+
+import re
+import shutil
+import tempfile
+from datetime import date
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile, Request
+from fastapi.responses import FileResponse
+from starlette.concurrency import run_in_threadpool
+from pydantic import BaseModel
+
+from backend.pipeline_manager import (
+    STATION_REGISTRY_LOCK,
+    ROOT,
+    manager,
+    read_station_config,
+    write_station_config,
+    resolve_root_path,
+)
+from src.ingestion.workbook_loader import (
+    load_station_workbook,
+    parse_selected_models,
+)
+from src.ingestion.station_weather import FORECAST_COLUMNS, station_weather
+from src.ingestion.raw_station_loader import (
+    parse_weather_locations, spark_clean_raw_source, load_cleaned_station_csv,
+)
+from src.ingestion.station_location_lookup import resolve_places, LocationLookupError
+from src.models.forecast_weather import ForecastWeatherUnavailable
+from src.models.forecast_contract import derive_forecast_contract
+from src.models.evaluation_splits import archived_weather_history, forecast_split_origins
+from src.storage.station_hierarchy import build_tree, parse_path, validate_path
+from backend.onboarding_training import DEFAULT_MODELS, initial_training, training_pending
+from backend.onboarding_jobs import (
+    progress as onboarding_progress,
+    request_quality_confirmation,
+    decide_quality_confirmation,
+    RegistrationDeclined,
+    in_onboarding_job,
+)
+from backend.onboarding_quality import build_quality_review
+
+router = APIRouter(prefix="/stations", tags=["stations"])
+
+
+class DeleteStationRequest(BaseModel):
+    confirm_station_id: str
+
+
+def _station_key(value: str) -> str:
+    key = re.sub(r"[^a-zA-Z0-9_-]+", "-", value.strip()).lower().strip("-_")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{1,31}", key):
+        raise HTTPException(
+            status_code=422,
+            detail="Station ID must contain 2–32 letters, numbers, hyphens or underscores.",
+        )
+    return key
+
+
+def _read_model_settings() -> dict[str, Any]:
+    path = ROOT / "config" / "model.yaml"
+    import yaml
+    with path.open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def _write_csv(frame: pd.DataFrame, path: Path, relative_dir: Path | None = None) -> str:
+    output = frame.copy()
+    if "utc_timestamp" in output.columns:
+        output["utc_timestamp"] = pd.to_datetime(output["utc_timestamp"], utc=True).dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    output.to_csv(path, index=False)
+    return ((relative_dir / path.name) if relative_dir is not None else path).relative_to(ROOT).as_posix()
+
+
+def _validate_model_row_counts(
+    datasets: dict[str, pd.DataFrame],
+    selected_models: list[str],
+    interval_minutes: int,
+    historical: dict[str, pd.DataFrame],
+    replay_start: pd.Timestamp | None,
+    history_steps: int,
+    horizon_steps: int,
+    managed_weather: bool = False,
+    live_kafka: bool = False,
+    residual_demand_unit: str = "mwh_per_interval",
+) -> dict[str, Any]:
+    """Fail onboarding early where the shipped trainers cannot form valid splits."""
+    from backend.model_api import training_options_for
+
+    validation_fraction = training_options_for()["validation_fraction"]
+    counts: dict[str, Any] = {}
+    if any(model in selected_models for model in ("solar_forecast", "wind_forecast", "residual_anomaly")) and interval_minutes != 15:
+        raise ValueError(
+            "The selected solar, wind and residual-load anomaly trainers currently require 15-minute data. "
+            "Set interval_minutes to 15 or deselect those models."
+        )
+
+    if "demand_forecast" in selected_models:
+        demand_history = historical["demand"]
+        weather_columns = ["forecast_temperature"] if managed_weather else []
+        fit_frame = demand_history
+        try:
+            fit_frame = (archived_weather_history(demand_history, weather_columns, history_steps)
+                         if managed_weather else demand_history)
+            origins, train_end, validation_end = forecast_split_origins(
+                fit_frame, history_steps, horizon_steps, interval_minutes, validation_fraction,
+                replay_start is not None, weather_columns,
+            )
+        except ValueError as exc:
+            raise ValueError(f"Worksheet 'Demand' has {len(fit_frame):,} usable historical rows. {exc}") from exc
+        usable_rows = len(fit_frame)
+        stream_rows = len(datasets["demand"]) - len(demand_history) if not live_kafka else 0
+        if not live_kafka and stream_rows < horizon_steps:
+            raise ValueError(
+                f"Worksheet 'Demand' reserves {stream_rows:,} stream rows; at least {horizon_steps:,} are required."
+            )
+        counts["demand_forecast"] = {
+            "total_rows": len(datasets["demand"]),
+            "training_rows": int(usable_rows),
+            "fit_rows": train_end,
+            "eligible_origins_by_split": [len(group) for group in origins],
+            "validation_rows": validation_end - train_end,
+            "test_rows": usable_rows - validation_end,
+            "stream_rows": int(stream_rows),
+        }
+
+    for model_name, dataset_name in (("solar_forecast", "solar"), ("wind_forecast", "wind")):
+        if model_name not in selected_models:
+            continue
+        frame = historical[dataset_name]
+        weather_columns = list(FORECAST_COLUMNS[dataset_name].values()) if managed_weather else []
+        try:
+            if managed_weather:
+                frame = archived_weather_history(frame, weather_columns, 672)
+            origins, train_end, val_end = forecast_split_origins(
+                frame, 672, 96, 15, validation_fraction, True, weather_columns,
+            )
+        except ValueError as exc:
+            raise ValueError(f"Worksheet '{dataset_name.title()}': {exc}") from exc
+        n_rows = len(frame)
+        counts[model_name] = {
+            "total_rows": int(n_rows),
+            "train_rows": int(train_end),
+            "eligible_origins_by_split": [len(group) for group in origins],
+            "validation_rows": int(val_end - train_end),
+            "test_rows": int(n_rows - val_end),
+        }
+
+    if "residual_anomaly" in selected_models:
+        from src.models.residual.training_data import build_training_frame
+        combined = build_training_frame(historical["demand"], historical["solar"], historical["wind"],
+                                        residual_demand_unit)
+        n=len(combined)
+        fit_end=int(n*0.80); cal_start=int(n*0.90)
+        if fit_end < 2*365*96 or cal_start-fit_end < 20*96 or n-cal_start < 20*96:
+            raise ValueError("Residual Autoencoder needs at least two full years for fit plus 20 days for each validation and calibration split.")
+        counts['residual_anomaly']={"total_rows":n,"fit_rows":fit_end,"validation_rows":cal_start-fit_end,"calibration_rows":n-cal_start}
+    return counts
+
+
+def _historical_frames(datasets: dict[str, pd.DataFrame], replay_start: pd.Timestamp | None,
+                       stream_fraction: float, stream_input: str, managed_weather: bool) -> dict[str, pd.DataFrame]:
+    if replay_start is not None:
+        return {kind: frame.loc[frame["utc_timestamp"] < replay_start] for kind, frame in datasets.items()}
+
+    # Older API callers still use the fractional upload split.
+    historical = dict(datasets)
+    if "demand" in datasets:
+        demand = datasets["demand"]
+        split_at = int(len(demand) * (1.0 - stream_fraction))
+        historical["demand"] = demand.iloc[:split_at]
+        if managed_weather and stream_input == "csv_replay":
+            old_start = demand["utc_timestamp"].iloc[split_at]
+            for kind in ("solar", "wind"):
+                if kind in datasets:
+                    frame = datasets[kind]
+                    historical[kind] = frame.loc[frame["utc_timestamp"] < old_start]
+    return historical
+
+
+@router.get("")
+def list_stations():
+    return read_station_config()
+
+
+@router.get("/hierarchy")
+def station_tree():
+    config = read_station_config()
+    return {"nodes": build_tree(config.get("stations", {})), "active_station": config.get("active_station")}
+
+
+@router.get("/template")
+def download_station_template():
+    """Download the exact workbook used by workbook onboarding."""
+    path = ROOT / "templates" / "Station_Training_Template.xlsx"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Station workbook template is not installed.")
+    return FileResponse(
+        path=path,
+        filename="Station_Training_Template.xlsx",
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@router.get("/active")
+def active_station():
+    config = read_station_config()
+    station = config.get("active_station")
+    return {"active_station": station, "available_stations": list(config.get("stations", {}).keys())}
+
+
+class ResolveStationLocationsRequest(BaseModel):
+    # Users enter place names and pick a returned candidate in the UI.
+    locations: list[str]
+
+
+@router.post("/locations/resolve")
+def resolve_station_locations(request: ResolveStationLocationsRequest):
+    """Return geocoding candidates without mutating station configuration.
+
+    Weather downloads still happen only during normal station onboarding.
+    """
+    try:
+        return {"locations": resolve_places(request.locations)}
+    except LocationLookupError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+# Page-independent registration: return immediately after staging the customer's file.
+# The existing /stations/onboard endpoint remains available for old API clients.
+@router.post("/onboard/jobs", status_code=202)
+async def create_station_onboarding_job(request: Request):
+    from backend.onboarding_jobs import enqueue_job
+    from starlette.datastructures import UploadFile as StarletteUploadFile
+    form = await request.form()
+    upload = form.get("file")
+    if not isinstance(upload, StarletteUploadFile):
+        raise HTTPException(status_code=422, detail="Attach one raw CSV or Excel file")
+    station_id = str(form.get("station_id") or "").strip()
+    allowed = {
+        "display_name", "stream_fraction", "timestamp_format", "source_timezone",
+        "interval_minutes", "selected_models", "stream_input", "residual_demand_unit",
+        "raw_topic", "featured_topic", "hierarchy_path", "replay_start_date",
+        "weather_locations", "numeric_locale", "raw_sheet_name", "raw_column_overrides",
+        "upload_mode",
+    }
+    values = {key: str(value) for key, value in form.multi_items()
+              if key in allowed and isinstance(value, str)}
+    try:
+        return await enqueue_job(station=station_id, upload=upload, values=values)
+    finally:
+        await upload.close()
+
+
+@router.get("/onboard/jobs")
+def list_station_onboarding_jobs(limit: int = 10):
+    from backend.onboarding_jobs import recent_jobs
+    return {"jobs": recent_jobs(limit)}
+
+
+@router.get("/onboard/jobs/{job_id}")
+def get_station_onboarding_job(job_id: str):
+    from backend.onboarding_jobs import get_job
+    return get_job(job_id)
+
+
+@router.post("/onboard/jobs/{job_id}/quality-decision")
+async def submit_onboarding_quality_decision(job_id: str, request: Request):
+    """Only the station's explicitly confirmed quality review releases registration."""
+    payload = await request.json()
+    if not isinstance(payload, dict) or type(payload.get("approved")) is not bool:
+        raise HTTPException(422, detail="Submit {\"approved\": true or false")
+    return decide_quality_confirmation(job_id, approved=payload["approved"])
+
+
+@router.get("/onboard/jobs/{job_id}/spark-log")
+def get_onboarding_spark_log(job_id: str):
+    """Read only this job's bounded Spark log tail (never arbitrary file paths)."""
+    from collections import deque
+    from backend.onboarding_jobs import get_job
+    job = get_job(job_id)
+    safe_station = _station_key(job["station"])
+    path = ROOT / "logs" / f"{safe_station}_raw_spark.log"
+    if not path.is_file():
+        return {"station": safe_station, "lines": [], "available": False}
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        lines = list(deque(f, maxlen=30))
+    return {"station": safe_station, "lines": [s.rstrip()[-350:] for s in lines],
+            "available": True}
+
+
+@router.post("/onboard")
+async def onboard_station(
+    station_id: str = Form(...),
+    file: UploadFile = File(...),
+    display_name: str | None = Form(default=None),
+    stream_fraction: float = Form(default=0.20),
+    timestamp_format: str = Form(default="auto"),
+    source_timezone: str = Form(default="UTC"),
+    interval_minutes: int = Form(default=15),
+    selected_models: str = Form(default=""),
+    stream_input: str = Form(default="csv_replay"),
+    residual_demand_unit: str = Form(default="mwh_per_interval"),
+    raw_topic: str | None = Form(default=None),
+    featured_topic: str | None = Form(default=None),
+    hierarchy_path: str = Form(default=""),
+    replay_start_date: date | None = Form(default=None),
+    weather_locations: str = Form(default=""),
+    numeric_locale: str = Form(default="de"),
+    raw_sheet_name: str = Form(default=""),
+    raw_column_overrides: str = Form(default=""),
+    upload_mode: str = Form(default="auto"),
+):
+    """Register a station from one raw CSV/Excel file, cleaned by Spark.
+
+    All four model components are enabled by default. ``selected_models`` may
+    contain a comma-separated or JSON-array list of component IDs, allowing
+    the onboarding UI to deselect each component independently.
+    """
+    onboarding_progress("validation", "Checking station ID, hierarchy, model options and replay date")
+    key = _station_key(station_id)
+    # Direct Python callers may omit FastAPI Form values, leaving Form objects.
+    if not isinstance(upload_mode, str):
+        upload_mode = "auto"
+    if not isinstance(weather_locations, str):
+        weather_locations = ""
+    if not isinstance(numeric_locale, str):
+        numeric_locale = "de"
+    if not isinstance(raw_sheet_name, str):
+        raw_sheet_name = ""
+    if not isinstance(raw_column_overrides, str):
+        raw_column_overrides = ""
+    if not isinstance(stream_input, str):
+        stream_input = "csv_replay"
+    if stream_input not in {"csv_replay", "kafka"}:
+        raise HTTPException(status_code=422, detail="Choose csv_replay or kafka for stream input.")
+    stream_fraction = float(stream_fraction) if isinstance(stream_fraction, (int, float)) else 0.20
+    replay_start = None
+    if isinstance(replay_start_date, date):
+        if stream_input != "csv_replay":
+            raise HTTPException(status_code=422, detail="A replay start date applies only to historical CSV replay.")
+        replay_start = pd.Timestamp(replay_start_date, tz="UTC")
+    elif not 0.10 <= stream_fraction <= 0.50:
+        raise HTTPException(status_code=422, detail="stream_fraction must be between 0.10 and 0.50.")
+    if not file.filename or Path(file.filename).suffix.lower() not in {".csv", ".xlsx", ".xlsm"}:
+        raise HTTPException(status_code=422, detail="Upload one raw CSV, XLSX or XLSM file.")
+    if upload_mode not in {"auto", "raw", "legacy_template"}:
+        raise HTTPException(status_code=422, detail="Unknown upload mode.")
+    if upload_mode == "auto":
+        # Preserve older API clients that still send the historical workbook.
+        # The customer-facing portal explicitly sends upload_mode=raw.
+        upload_mode = ("legacy_template" if file.filename.lower().endswith((".xlsx", ".xlsm"))
+                       and not weather_locations.strip() else "raw")
+    if numeric_locale not in {"de", "en"}:
+        raise HTTPException(status_code=422, detail="Number locale must be de or en.")
+    if upload_mode == "raw" and not in_onboarding_job():
+        raise HTTPException(status_code=409, detail=(
+            "For raw uploads use /stations/onboard/jobs. Customer quality confirmation "
+            "is required before station registration or model deployment."
+        ))
+
+    config = read_station_config()
+    stations = config.setdefault("stations", {})
+    if key in stations:
+        raise HTTPException(status_code=409, detail=f"Station '{key}' is already registered.")
+
+    try:
+        selected = parse_selected_models(selected_models)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    if not isinstance(residual_demand_unit, str):
+        residual_demand_unit = 'mwh_per_interval'
+    if residual_demand_unit not in ('mw','mwh_per_interval'):
+        raise HTTPException(status_code=422, detail='Demand units must be MW or MWh per 15-minute interval')
+    model_settings = _read_model_settings()
+    interval_minutes = int(interval_minutes or model_settings.get("interval_minutes", 15))
+    try:
+        forecast_contract = derive_forecast_contract(interval_minutes, model_settings)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    try:
+        parents = parse_path(hierarchy_path) if isinstance(hierarchy_path, str) else []
+        parents = validate_path(stations, parents, interval_minutes)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if parents and "demand_forecast" not in selected:
+        raise HTTPException(status_code=422, detail="Select demand forecasting for a hierarchy substation's live feed.")
+    history_steps = int(forecast_contract["history_steps"])
+    horizon_steps = int(forecast_contract["horizon_steps"])
+
+    station_parent = ROOT / "data" / "raw" / "stations"
+    station_parent.mkdir(parents=True, exist_ok=True)
+    station_dir = station_parent / key
+    if station_dir.exists():
+        raise HTTPException(status_code=409, detail=f"Station data folder already exists for '{key}'. Clean it up or choose another ID.")
+    staging_dir = Path(tempfile.mkdtemp(prefix=f".{key}_onboard_", dir=station_parent))
+
+    try:
+        upload_path = staging_dir / ("source_upload" + Path(file.filename).suffix.lower())
+        size_bytes = 0
+        with upload_path.open("wb") as destination:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size_bytes += len(chunk)
+                if size_bytes > 200 * 1024 * 1024:
+                    raise HTTPException(status_code=413, detail="Raw upload exceeds the 200 MB station onboarding limit.")
+                destination.write(chunk)
+        if size_bytes == 0:
+            raise HTTPException(status_code=422, detail="The uploaded workbook is empty.")
+
+        try:
+            if upload_mode == "raw":
+                onboarding_progress("spark", "Spark is cleaning the raw file and checking timestamps, values and gaps")
+                weather_config = parse_weather_locations(weather_locations)
+                clean_path, raw_quality_report, processing_log = await run_in_threadpool(
+                    spark_clean_raw_source, upload_path, staging_dir, ROOT, key,
+                    source_timezone=source_timezone or "auto",
+                    interval_minutes=interval_minutes,
+                    number_locale=numeric_locale, sheet_name=raw_sheet_name,
+                    column_overrides=raw_column_overrides,
+                )
+                datasets, workbook_diagnostics = await run_in_threadpool(
+                    load_cleaned_station_csv, clean_path, selected, weather_config, interval_minutes,
+                )
+                workbook_diagnostics["raw_spark_quality"] = raw_quality_report
+                workbook_diagnostics["raw_spark_log"] = f"logs/{key}_raw_spark.log"
+            else:
+                if upload_path.suffix == ".csv":
+                    raise ValueError("Legacy template mode requires XLSX.")
+                datasets, workbook_diagnostics = await run_in_threadpool(
+                    load_station_workbook, upload_path,
+                    selected_models=selected,
+                    interval_minutes=interval_minutes,
+                    timestamp_format=timestamp_format,
+                    source_timezone=source_timezone or "UTC",
+                    location_from_workbook=True,
+                )
+            onboarding_progress("quality", "Spark cleaning completed; checking model input quality")
+            grid_offset = None
+            if parents:
+                timestamp = pd.Timestamp(datasets["demand"]["utc_timestamp"].iloc[0])
+                offset_ns = timestamp.value % (interval_minutes * 60 * 10**9)
+                grid_offset, fraction = divmod(offset_ns, 10**9)
+                if fraction:
+                    raise ValueError("Hierarchy observation timestamps must use whole seconds.")
+                for frame in datasets.values():
+                    other = pd.Timestamp(frame["utc_timestamp"].iloc[0])
+                    if other.value % (interval_minutes * 60 * 10**9) != offset_ns:
+                        raise ValueError("All substation worksheets must use the same UTC interval grid.")
+                parents = validate_path(stations, parents, interval_minutes, grid_offset)
+            weather_config = workbook_diagnostics.get("weather")
+            # Validate the shared timestamp before downloading weather.
+            if replay_start is not None and "demand" in datasets:
+                if not datasets["demand"]["utc_timestamp"].eq(replay_start).any():
+                    raise ValueError(
+                        f"Worksheet 'Demand' needs an observation at {replay_start:%Y-%m-%d %H:%M} UTC. "
+                        "Select a date covered by the workbook with a reading at midnight UTC."
+                    )
+            if stream_input == "kafka" and not weather_config:
+                raise ValueError("Kafka live input requires the Station Location worksheet.")
+            if weather_config and horizon_steps * interval_minutes > 1440:
+                raise ValueError("Archived day-ahead weather supports forecast horizons up to 24 hours.")
+            # Hold registration BEFORE external weather requests, registry writes,
+            # Kafka topic creation and model training. Spark hard rejections above
+            # remain non-overridable; accepted warning datasets need explicit consent.
+            if upload_mode == "raw":
+                quality_review = build_quality_review(raw_quality_report, key)
+                await request_quality_confirmation(quality_review)
+            if weather_config:
+                onboarding_progress("weather", "Fetching/caching historical and forecast weather for the confirmed locations")
+                weather = await run_in_threadpool(station_weather, ROOT, key, {"weather": weather_config})
+                await run_in_threadpool(weather.enrich, datasets)
+                for kind, frame in datasets.items():
+                    diagnostics = workbook_diagnostics["worksheets"][kind.title()]
+                    diagnostics["columns"] = list(frame.columns)
+                    columns = list(FORECAST_COLUMNS[kind].values())
+                    diagnostics["missing_day_ahead_rows"] = int(frame[columns].isna().any(axis=1).sum())
+            onboarding_progress("preparation", "Weather enrichment complete; splitting training and replay data")
+            historical = _historical_frames(datasets, replay_start, stream_fraction, stream_input, bool(weather_config))
+            model_row_counts = await run_in_threadpool(
+                _validate_model_row_counts, datasets, selected, interval_minutes, historical, replay_start,
+                history_steps, horizon_steps, bool(weather_config), stream_input == "kafka", residual_demand_unit,
+            )
+        except ForecastWeatherUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        onboarding_progress("preparation", "Preparing Demand, Solar, Wind Energy and residual-load datasets")
+        # Preserve the original workbook for traceability, and write normalized
+        # model-facing CSVs alongside it. The source remains separate from the
+        # generated training/stream partitions.
+        source_filename = f"{key}_source{upload_path.suffix}"
+        upload_path.rename(staging_dir / source_filename)
+
+        model_components: dict[str, dict[str, Any]] = {}
+        relative_files: dict[str, str] = {}
+        demand_frame = datasets.get("demand")
+        demand_forecast_paths: dict[str, str] = {}
+
+        if demand_frame is not None:
+            if "demand_forecast" in selected:
+                train_frame = historical["demand"]
+                stream_frame = demand_frame.iloc[len(train_frame):]
+                history_frame = (demand_frame if stream_input == "kafka" else train_frame).tail(history_steps).copy()
+
+                demand_training = staging_dir / f"{key}_demand_training.csv"
+                demand_history = staging_dir / f"{key}_demand_history.csv"
+                demand_stream = staging_dir / f"{key}_demand_stream.csv"
+                demand_forecast_paths = {
+                    "training_file": _write_csv(train_frame, demand_training, station_dir),
+                    "history_file": _write_csv(history_frame, demand_history, station_dir),
+                    "input_file": _write_csv(stream_frame, demand_stream, station_dir),
+                }
+                relative_files.update({f"demand_{name}": value for name, value in demand_forecast_paths.items()})
+                model_components["demand_forecast"] = {
+                    "enabled": True,
+                    "algorithm": DEFAULT_MODELS["demand_forecast"],
+                    "status": "pending_training",
+                    **demand_forecast_paths,
+                    "checkpoint": f"models/{key}/v1/{key}_encoder_decoder_lstm.pt",
+                    "metadata": f"models/{key}/v1/metadata.json",
+                }
+                if "temperature" not in demand_frame.columns:
+                    raise HTTPException(status_code=422, detail="Worksheet 'Demand' must include temperature when demand_forecast is selected.")
+            else:
+                model_components["demand_forecast"] = {
+                    "enabled": False, "algorithm": DEFAULT_MODELS["demand_forecast"], "status": "deselected"
+                }
+
+        else:
+            model_components["demand_forecast"] = {"enabled": False, "algorithm": DEFAULT_MODELS["demand_forecast"], "status": "deselected"}
+
+        # Residual-load data is derived from all three historical worksheets,
+        # not a separate demand-only input. Preserve a validated combined training snapshot.
+        if "residual_anomaly" in selected:
+            from src.models.residual.training_data import build_training_frame
+            # Train only before replay starts; no future test-stream measurements.
+            residual_frame = build_training_frame(historical["demand"], historical["solar"], historical["wind"],
+                                                  residual_demand_unit)
+            residual_file=staging_dir / f"{key}_residual_training.csv"
+            residual_rel=_write_csv(residual_frame,residual_file,station_dir)
+            relative_files['residual_training_file']=residual_rel
+            model_components['residual_anomaly']={
+                'enabled':True,'algorithm':'dense_autoencoder','status':'pending_training',
+                'training_file':residual_rel,
+                'checkpoint':f'models/{key}/residual_anomaly/residual_ae_portable.pt',
+                'metadata':f'models/{key}/residual_anomaly/training_summary.json',
+            }
+        else:
+            model_components['residual_anomaly']={'enabled':False,'algorithm':'dense_autoencoder','status':'deselected'}
+
+        renewable_components: dict[str, Any] = {}
+        for kind in ("solar", "wind"):
+            model_id = f"{kind}_forecast"
+            if model_id in selected:
+                frame = datasets[kind]
+                data_path = staging_dir / f"{key}_{kind}_data.csv"
+                data_rel = _write_csv(frame, data_path, station_dir)
+                relative_files[f"{kind}_data_file"] = data_rel
+                training_rel = data_rel
+                replay_rel = None
+                if historical[kind] is not frame:
+                    training_rel = _write_csv(historical[kind], staging_dir / f"{key}_{kind}_training.csv", station_dir)
+                    relative_files[f"{kind}_training_file"] = training_rel
+                if replay_start is not None:
+                    replay_frame = frame.loc[frame["utc_timestamp"] >= replay_start]
+                    if not replay_frame.empty:
+                        replay_rel = _write_csv(replay_frame, staging_dir / f"{key}_{kind}_replay.csv", station_dir)
+                        relative_files[f"{kind}_replay_file"] = replay_rel
+                algorithm = DEFAULT_MODELS[model_id]
+                checkpoint = f"models/{key}/{kind}_{algorithm}/model.pt"
+                metadata = f"models/{key}/{kind}_{algorithm}/metadata.json"
+                version = f"{key}-{kind}-{algorithm}-v1"
+                renewable_components[kind] = {
+                    "enabled": True,
+                    # Keep all generation actuals for serving and a pre-replay training source.
+                    "train_file": training_rel,
+                    "test_file": None,
+                    **({"replay_file": replay_rel} if replay_rel else {}),
+                    "data_file": data_rel,
+                    "checkpoint": checkpoint,
+                    "metadata": metadata,
+                    "model_version": version,
+                    "algorithm": algorithm,
+                    "status": "pending_training",
+                }
+                model_components[model_id] = {
+                    "enabled": True,
+                    "algorithm": algorithm,
+                    "status": "pending_training",
+                    "training_file": training_rel,
+                    "checkpoint": checkpoint,
+                    "metadata": metadata,
+                }
+            else:
+                renewable_components[kind] = {"enabled": False, "status": "deselected"}
+                model_components[model_id] = {
+                    "enabled": False, "algorithm": DEFAULT_MODELS[model_id], "status": "deselected"
+                }
+
+        # Solar and wind may be trained and deployed independently. Newly
+        # registered components remain pending until a model is deployed;
+        # the serving adapter skips missing checkpoints safely.
+        any_renewable_selected = any(x in selected for x in ("solar_forecast", "wind_forecast"))
+        final_station_dir = station_dir
+
+        display = display_name.strip() if display_name and display_name.strip() else key.upper()
+        station_entry: dict[str, Any] = {
+            "display_name": display,
+            "enabled": False,
+            "status": "registered",
+            "enabled_models": selected,
+            "initial_training": initial_training(selected),
+            "model_components": model_components,
+            "raw_topic": (raw_topic or "").strip() or f"{key}-raw",
+            "featured_topic": (featured_topic or "").strip() or f"{key}-featured",
+            "actuals_file": f"data/processed/stations/{key}/actuals.csv",
+            "forecasts_file": f"data/processed/stations/{key}/forecasts.csv",
+            "renewable_forecasts_file": f"data/processed/stations/{key}/renewable_forecasts.csv",
+            "interval_minutes": interval_minutes,
+            "history_window_hours": forecast_contract["history_window_hours"],
+            "forecast_horizon_hours": forecast_contract["forecast_horizon_hours"],
+            "history_steps": history_steps,
+            "horizon_steps": horizon_steps,
+            "source_timezone": "UTC" if upload_mode == "raw" else (source_timezone or "UTC"),
+            "timestamp_format": timestamp_format,
+            "registered_source_file": file.filename,
+            "source_format": upload_mode,
+            "source_input_timezone": source_timezone or "auto",
+            **({"raw_spark_cleaned_file": f"data/raw/stations/{key}/{upload_path.stem}_cleaned.csv",
+                "raw_spark_quality_file": f"data/raw/stations/{key}/{upload_path.stem}_quality.json"}
+                if upload_mode == "raw" else {}),
+            "archived_source_file": f"data/raw/stations/{key}/{source_filename}",
+            "registered_file_size_bytes": int(size_bytes),
+            "model_data_diagnostics": workbook_diagnostics,
+            "model_row_counts": model_row_counts,
+            **({"replay_start_date": replay_start_date.isoformat()} if replay_start is not None
+               else {"stream_fraction": float(stream_fraction)}),
+            "residual_demand_unit": residual_demand_unit,
+            "stream_delay_seconds": 2.0 if weather_config or replay_start is not None else 0.3,
+            "renewables": {
+                "enabled": any_renewable_selected,
+                "components_enabled": {
+                    "solar": "solar_forecast" in selected,
+                    "wind": "wind_forecast" in selected,
+                },
+                "serving_adapter_supported": any_renewable_selected,
+                "interval_minutes": interval_minutes,
+                "forecast_every_steps": 1,
+                **renewable_components,
+            },
+        }
+        if weather_config:
+            station_entry["weather"] = weather_config
+        if demand_frame is not None:
+            station_entry.update({
+                "registered_rows": int(len(demand_frame)),
+                "demand_data_file": None,
+                "demand_start_utc": pd.Timestamp(demand_frame["utc_timestamp"].iloc[0]).isoformat(),
+                "demand_end_utc": pd.Timestamp(demand_frame["utc_timestamp"].iloc[-1]).isoformat(),
+            })
+        if "demand_forecast" in selected:
+            checkpoint_rel = f"models/{key}/v1/{key}_encoder_decoder_lstm.pt"
+            station_entry.update({
+                "training_file": demand_forecast_paths["training_file"],
+                "history_file": demand_forecast_paths["history_file"],
+                "input_file": demand_forecast_paths["input_file"],
+                "model_checkpoint": checkpoint_rel,
+                "model_metadata": f"models/{key}/v1/metadata.json",
+                "model_version": "v1",
+                "model_algorithm": DEFAULT_MODELS["demand_forecast"],
+                "training_rows": int(len(train_frame)),
+                "history_rows": int(min(history_steps, len(train_frame))),
+                "stream_rows": int(len(stream_frame)) if stream_input == "csv_replay" else 0,
+                "stream_start_utc": pd.Timestamp(stream_frame["utc_timestamp"].iloc[0]).isoformat(),
+                "stream_end_utc": pd.Timestamp(stream_frame["utc_timestamp"].iloc[-1]).isoformat(),
+            })
+            if stream_input == "csv_replay" and (replay_start is not None or weather_config):
+                station_entry["expected_stream_start_utc"] = station_entry["stream_start_utc"]
+        if "residual_anomaly" in selected:
+            station_entry["residual_model_checkpoint"] = model_components["residual_anomaly"]["checkpoint"]
+            station_entry["residual_model_summary"] = model_components["residual_anomaly"]["metadata"]
+            station_entry["residual_detection_settings"] = {
+                "decision_rule": "both", "upward_only": True,
+                "stat_threshold": None, "ae_threshold": None,
+            }
+
+        # Serialize registration with station activation/deletion. Workbook
+        # loading and external requests run outside this critical section.
+        station_entry["stream_input"] = stream_input
+        station_entry["topics_ready"] = False
+        onboarding_progress("registry", "Saving registered station, hierarchy, replay files and model configuration")
+        with STATION_REGISTRY_LOCK:
+            config = read_station_config()
+            stations = config.setdefault("stations", {})
+            if key in stations or final_station_dir.exists():
+                raise HTTPException(status_code=409, detail=f"Station '{key}' is already registered.")
+            topics = {station_entry["raw_topic"], station_entry["featured_topic"]}
+            if len(topics) != 2:
+                raise HTTPException(status_code=422, detail="Raw and featured Kafka topics must be different.")
+            for other, entry in stations.items():
+                if topics & {entry.get("raw_topic"), entry.get("featured_topic")}:
+                    raise HTTPException(status_code=409, detail=f"Kafka topics already assigned to '{other}'.")
+            if parents:
+                try:
+                    station_entry["hierarchy_path"] = validate_path(stations, parents, interval_minutes, grid_offset)
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+                station_entry["hierarchy_grid_offset_seconds"] = grid_offset
+            staging_dir.rename(final_station_dir)
+            stations[key] = station_entry
+            try:
+                write_station_config(config)
+            except Exception:
+                shutil.rmtree(final_station_dir, ignore_errors=True)
+                raise
+
+        onboarding_progress("topics", "Creating/checking station Kafka topics")
+        topic_result = None
+        topic_warning = None
+        if "demand_forecast" in selected:
+            try:
+                topic_result = await run_in_threadpool(manager.ensure_station_topics, key)
+            except Exception as exc:
+                topic_warning = str(exc)
+        else:
+            topic_warning = "Demand forecasting was deselected; demand streaming topics were not initialized."
+        with STATION_REGISTRY_LOCK:
+            updated = read_station_config()
+            current = updated.get("stations", {}).get(key)
+            if current is not None:
+                current["topics_ready"] = bool(topic_result) or bool(current.get("topics_ready"))
+                if topic_warning and not current["topics_ready"]:
+                    current["topic_setup_message"] = topic_warning
+                write_station_config(updated)
+
+        onboarding_progress("training", "Station registered; model training will be scheduled by FastAPI")
+        return {
+            "station": key,
+            "display_name": display,
+            "registered": True,
+            "hierarchy_path": station_entry.get("hierarchy_path", []),
+            "enabled_models": selected,
+            "model_components": model_components,
+            "files": relative_files,
+            "model_row_counts": model_row_counts,
+            "workbook_diagnostics": workbook_diagnostics,
+            "raw_spark_quality": workbook_diagnostics.get("raw_spark_quality"),
+            "weather": weather_config,
+            "topics": topic_result,
+            "topics_ready": bool(topic_result),
+            "topic_warning": topic_warning,
+            "renewable_serving_adapter_ready": any_renewable_selected,
+            "initial_training": station_entry["initial_training"],
+            "replay_start_date": station_entry.get("replay_start_date"),
+            "stream_start_utc": station_entry.get("stream_start_utc"),
+            "next_step": "Initial training and model deployment run automatically. Activate the station when it is ready.",
+        }
+    except (HTTPException, RegistrationDeclined):
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Station onboarding failed: {exc}") from exc
+    finally:
+        await file.close()
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir, ignore_errors=True)
+
+
+def _status_from_snapshot(station: str, entry: dict, snapshot: dict) -> dict:
+    """Compose a station status from one shared process/runtime snapshot."""
+    processes = snapshot.get("processes", {})
+    services = {
+        name: processes.get(manager.process_key(name, station), {
+            "running": False, "pid": None, "return_code": None,
+        })
+        for name in manager.SERVICE_NAMES
+    }
+    active_model = entry.get("active_model") or {}
+    checkpoint_value = active_model.get("artifact_path") or entry.get("model_checkpoint")
+    checkpoint = resolve_root_path(checkpoint_value) if checkpoint_value else ROOT / "__missing_model__"
+    status = {
+        "station": station,
+        "kafka_tcp_available": bool(snapshot.get("kafka_tcp_available")),
+        "services": services,
+        "quality_consumer": processes.get("quality", {"running": False, "pid": None, "return_code": None}),
+        "model_checkpoint": str(checkpoint),
+        "model_ready": checkpoint.is_file(),
+        "active_model": active_model or None,
+        "topics": {"raw": entry.get("raw_topic"), "featured": entry.get("featured_topic")},
+    }
+    data_services = [services[name] for name in ("spark", "predictor", "producer")]
+    if services.get("live_actuals"):
+        data_services.append(services["live_actuals"])
+    if any(service.get("state") == "failed" for service in data_services):
+        lifecycle = "failed"
+    elif any(service.get("state") == "restarting" for service in data_services):
+        lifecycle = "recovering"
+    elif any(service.get("running") for service in data_services):
+        lifecycle = "active"
+    elif services.get("training", {}).get("running") or training_pending(entry):
+        lifecycle = "training" if services.get("training", {}).get("running") else "training_queued"
+    elif entry.get("status") == "stopped":
+        lifecycle = "stopped"
+    elif any(task["status"] == "failed" for task in (entry.get("initial_training") or {}).values()):
+        lifecycle = "model_ready" if status["model_ready"] else "training_failed"
+    elif services.get("training", {}).get("return_code") is not None:
+        lifecycle = "model_ready" if status["model_ready"] and services["training"]["return_code"] == 0 else "training_failed"
+    elif entry.get("status") == "training":
+        lifecycle = "training_failed"
+    elif status["model_ready"]:
+        lifecycle = "model_ready"
+    else:
+        lifecycle = entry.get("status", "registered")
+    status.update({
+        "lifecycle_status": lifecycle,
+        "initial_training": entry.get("initial_training", {}),
+        "initial_training_pending": training_pending(entry),
+        "display_name": entry.get("display_name", station),
+        "registered": True,
+        "training_file_exists": bool(entry.get("training_file") and resolve_root_path(entry["training_file"]).is_file()),
+        "history_file_exists": bool(entry.get("history_file") and resolve_root_path(entry["history_file"]).is_file()),
+        "stream_file_exists": bool(entry.get("input_file") and resolve_root_path(entry["input_file"]).is_file()),
+        "model_metadata": entry.get("model_metadata"),
+        "enabled_models": entry.get("enabled_models", []),
+        "model_components": entry.get("model_components", {}),
+        "interval_minutes": int(entry.get("interval_minutes", 15)),
+        "history_steps": int(entry.get("history_steps", 672)),
+        "horizon_steps": int(entry.get("horizon_steps", 96)),
+        "history_window_hours": float(entry.get("history_window_hours", 168)),
+        "forecast_horizon_hours": float(entry.get("forecast_horizon_hours", 24)),
+    })
+    return status
+
+
+@router.get("/overview")
+def stations_overview():
+    """Dashboard summary; a single process/Java/Kafka check for all stations.
+
+    This endpoint is informational and never changes running processes.
+    """
+    from backend.training_data import station_component_state, registered_source
+    config = read_station_config()
+    entries = config.get("stations", {})
+    snapshot = manager.status()
+    statuses = {}
+    component_statuses = {}
+    for station, entry in entries.items():
+        statuses[station] = _status_from_snapshot(station, entry, snapshot)
+        enabled = station_component_state(entry)
+        details = {}
+        for component, selected in enabled.items():
+            component_entry = (entry.get("model_components") or {}).get(component) or {}
+            if component == "demand_forecast":
+                checkpoint_value = (entry.get("active_model") or {}).get("artifact_path") or entry.get("model_checkpoint")
+            elif component == "residual_anomaly":
+                checkpoint_value = component_entry.get("checkpoint") or entry.get("residual_model_checkpoint")
+            else:
+                kind = component.split("_")[0]
+                checkpoint_value = (entry.get("renewables") or {}).get(kind, {}).get("checkpoint") or component_entry.get("checkpoint")
+            source = registered_source(entry, component)
+            details[component] = {
+                "enabled": bool(selected),
+                "training_data_exists": bool(source and resolve_root_path(source).is_file()),
+                "checkpoint_exists": bool(checkpoint_value and resolve_root_path(checkpoint_value).is_file()),
+            }
+        component_statuses[station] = details
+    return {
+        "active_station": config.get("active_station"),
+        "stations": entries,
+        "hierarchy": build_tree(entries),
+        "statuses": statuses,
+        "components": component_statuses,
+        "kafka_tcp_available": bool(snapshot.get("kafka_tcp_available")),
+    }
+
+
+@router.get("/{station}/status")
+def station_status(station: str):
+    entries = read_station_config().get("stations", {})
+    if station not in entries:
+        raise HTTPException(status_code=404, detail=f"Unknown station: {station}")
+    return _status_from_snapshot(station, entries[station], manager.status())
+
+
+@router.post("/{station}/retry-initial-training")
+def retry_initial_training(station: str):
+    with STATION_REGISTRY_LOCK:
+        config = read_station_config()
+        entry = config.get("stations", {}).get(station)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="Unknown station.")
+        if entry.get("enabled"):
+            raise HTTPException(status_code=409, detail="Stop this station before retrying initial training.")
+        tasks = entry.get("initial_training") or {}
+        count = 0
+        for component, task in tasks.items():
+            if task["status"] == "failed":
+                tasks[component] = {"algorithm": task["algorithm"], "status": "queued"}
+                count += 1
+        write_station_config(config)
+        return {"queued": count, "initial_training": tasks}
+
+
+@router.post("/{station}/train")
+def train_station(station: str):
+    try:
+        with STATION_REGISTRY_LOCK:
+            result = manager.start_training(station)
+            config = read_station_config()
+            config["stations"][station]["status"] = "training"
+            write_station_config(config)
+            return result
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/{station}/topics")
+def create_station_topics(station: str):
+    try:
+        with STATION_REGISTRY_LOCK:
+            result = manager.ensure_station_topics(station)
+            config = read_station_config()
+            config["stations"][station]["topics_ready"] = True
+            config["stations"][station].pop("topic_setup_message", None)
+            write_station_config(config)
+            return result
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/{station}/activate")
+def activate_station(station: str):
+    try:
+        return manager.start_pipeline(station)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/{station}/stop")
+def stop_station(station: str):
+    config = read_station_config().get("stations", {})
+    if station not in config:
+        raise HTTPException(status_code=404, detail=f"Unknown station: {station}")
+    return manager.stop_pipeline(station)
+
+
+@router.delete("/{station}")
+def delete_station(station: str, request: DeleteStationRequest):
+    """Permanently delete one station and its owned records after typed confirmation."""
+    if request.confirm_station_id.strip().lower() != station.strip().lower():
+        raise HTTPException(
+            status_code=422,
+            detail="Type the exact station ID to confirm permanent deletion.",
+        )
+    try:
+        return manager.delete_station(station, request.confirm_station_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+# ---------------------------------------------------------------------------
+# Per-station residual spike detection thresholds.
+# Updates are explicit and stored in stations.yaml; they never retrain an AE.
+# ---------------------------------------------------------------------------
+from pydantic import Field
+from typing import Literal
+from src.models.residual.service import DEFAULT_SETTINGS, settings_for
+
+class ResidualDetectionSettingsRequest(BaseModel):
+    decision_rule: Literal['both', 'either'] = 'both'
+    stat_threshold: float | None = Field(default=None, gt=0, le=10000)
+    ae_threshold: float | None = Field(default=None, gt=0, le=10000)
+    upward_only: bool = True
+
+@router.get('/{station}/residual-settings')
+def get_residual_settings(station: str):
+    config=read_station_config()
+    entry=config.get('stations',{}).get(station)
+    if entry is None:raise HTTPException(status_code=404,detail='Unknown station')
+    return {'station':station,'settings':settings_for(entry),
+            'checkpoint':entry.get('residual_model_checkpoint')}
+
+@router.put('/{station}/residual-settings')
+def put_residual_settings(station: str, request: ResidualDetectionSettingsRequest):
+    with STATION_REGISTRY_LOCK:
+        config=read_station_config()
+        entry=config.get('stations',{}).get(station)
+        if entry is None:raise HTTPException(status_code=404,detail='Unknown station')
+        # No edits to the physical pretrained checkpoint; thresholds apply at inference.
+        entry['residual_detection_settings']=request.model_dump() if hasattr(request,'model_dump') else request.dict()
+        entry.pop('residual_alert_settings', None)
+        write_station_config(config)
+        return {'station':station,'settings':entry['residual_detection_settings'],
+                'message':'Spike-detection thresholds saved for the next forecast origin.'}

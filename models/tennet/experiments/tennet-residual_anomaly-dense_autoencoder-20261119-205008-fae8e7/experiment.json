@@ -1,0 +1,28 @@
+{
+  "experiment_id": "tennet-residual_anomaly-dense_autoencoder-20261119-205008-fae8e7",
+  "station": "tennet",
+  "algorithm": "dense_autoencoder",
+  "component": "residual_anomaly",
+  "parameters": {
+    "epochs": 80,
+    "batch_size": 256,
+    "learning_rate": 0.001,
+    "hidden_dim": 256,
+    "bottleneck_dim": 32,
+    "patience": 5,
+    "train_stride": 24,
+    "stat_quantile": 0.99,
+    "ae_quantile": 0.99,
+    "validation_fraction": 0.1,
+    "seed": 42,
+    "num_threads": 2,
+    "train_fraction": 0.8
+  },
+  "training_options": {
+    "validation_fraction": 0.15
+  },
+  "training_data_path": "data/raw/stations/tennet/tennet_residual_training.csv",
+  "training_data_id": null,
+  "training_data_sha256": "c35b8a3363a241a5700570b2bc1a84a65df235c33841113c3c1a7f2a45be386e",
+  "created_at": "2026-11-19T15:20:08Z"
+}

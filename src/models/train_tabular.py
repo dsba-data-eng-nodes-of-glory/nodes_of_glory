@@ -1,0 +1,318 @@
+"""Train RF, gradient-boosted-tree or XGBoost forecasting regressors.
+
+The estimator is a shared one-step regressor with lead time as a feature. A
+forecast is produced by creating one row per configured future observation.
+"""
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+from typing import Any
+
+import joblib
+import numpy as np
+import pandas as pd
+import yaml
+from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+from src.ingestion.station_weather import FORECAST_WEATHER_MODE
+from src.ingestion.file_loader import load_station_csv
+from src.models.evaluation_splits import archived_weather_history, forecast_split_origins
+from src.models.model_registry import next_version, upsert_experiment, utc_now
+from src.models.forecast_contract import station_forecast_contract
+from src.models.tabular_forecasting import (
+    FEATURE_SCHEMA,
+    apply_demand_blend,
+    weekly_demand_baseline,
+    build_training_examples,
+    json_safe_parameters,
+)
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def load_yaml(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        return yaml.safe_load(handle) or {}
+
+
+def sample_origins(origins: np.ndarray, maximum: int) -> np.ndarray:
+    """Sample evenly across time; maximum=0 keeps every eligible origin."""
+    if maximum < 0:
+        raise ValueError("max_train_origins and max_validation_origins cannot be negative.")
+    if maximum == 0 or len(origins) <= maximum:
+        return origins
+    return origins[np.unique(np.linspace(0, len(origins) - 1, maximum, dtype=int))]
+
+
+def build_estimator(algorithm: str, params: dict[str, Any]):
+    if algorithm == "dense_nn":
+        from sklearn.neural_network import MLPRegressor
+        sizes = params.get("hidden_layer_sizes", "128,64")
+        if isinstance(sizes, str):
+            sizes = tuple(int(x.strip()) for x in sizes.split(",") if x.strip())
+        if not isinstance(sizes, (list, tuple)) or not sizes or any(int(x) < 1 or int(x) > 512 for x in sizes):
+            raise ValueError("hidden_layer_sizes must be a comma-separated list of positive integers <= 512")
+        from sklearn.pipeline import make_pipeline
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.compose import TransformedTargetRegressor
+        estimator = make_pipeline(StandardScaler(), MLPRegressor(
+            hidden_layer_sizes=tuple(int(x) for x in sizes),
+            max_iter=int(params.get("max_iter", 160)),
+            learning_rate_init=float(params.get("learning_rate_init", 0.001)),
+            alpha=float(params.get("alpha", 1e-4)),
+            random_state=int(params.get("random_state", 42)),
+            early_stopping=True, validation_fraction=0.1,
+            ))
+        return TransformedTargetRegressor(regressor=estimator, transformer=StandardScaler())
+    if algorithm == "random_forest":
+        allowed = {key: params[key] for key in (
+            "n_estimators", "max_depth", "min_samples_leaf", "random_state", "n_jobs"
+        ) if key in params}
+        return RandomForestRegressor(**allowed)
+    if algorithm == "gbt":
+        allowed = {key: params[key] for key in (
+            "max_iter", "max_leaf_nodes", "learning_rate", "l2_regularization", "random_state"
+        ) if key in params}
+        return HistGradientBoostingRegressor(**allowed)
+    if algorithm == "xgboost":
+        try:
+            from xgboost import XGBRegressor
+        except ImportError as exc:
+            raise RuntimeError(
+                "XGBoost is not installed. Install it with `pip install xgboost` and restart the backend."
+            ) from exc
+        allowed = {key: params[key] for key in (
+            "n_estimators", "max_depth", "learning_rate", "subsample",
+            "colsample_bytree", "reg_lambda", "random_state", "n_jobs"
+        ) if key in params}
+        allowed.update({"objective": "reg:squarederror", "tree_method": "hist"})
+        return XGBRegressor(**allowed)
+    raise ValueError(f"Unsupported tabular algorithm: {algorithm}")
+
+
+def calculate_metrics(actual: np.ndarray, predicted: np.ndarray) -> dict[str, float | int]:
+    actual = np.asarray(actual, dtype=float).reshape(-1)
+    predicted = np.asarray(predicted, dtype=float).reshape(-1)
+    error = predicted - actual
+    denominator = float(np.sum(np.abs(actual)))
+    return {
+        "mae_mw": float(mean_absolute_error(actual, predicted)),
+        "rmse_mw": float(np.sqrt(mean_squared_error(actual, predicted))),
+        "wape_pct": float(np.sum(np.abs(error)) / denominator * 100.0) if denominator else float("nan"),
+        "bias_mw": float(np.mean(error)),
+        "max_absolute_error_mw": float(np.max(np.abs(error))) if len(error) else float("nan"),
+        "matched_observations": int(len(actual)),
+    }
+
+
+def run_training(config: dict[str, Any]) -> dict[str, Any]:
+    overall_started = time.perf_counter()
+    station = str(config["station"])
+    algorithm = str(config["algorithm"])
+    experiment_id = str(config["experiment_id"])
+    parameters = json_safe_parameters(dict(config.get("parameters") or {}))
+    training_options = dict(config.get("training_options") or {})
+
+    station_registry = load_yaml(ROOT / "config" / "stations.yaml").get("stations", {})
+    if station not in station_registry:
+        raise ValueError(f"Unknown station '{station}'.")
+    station_entry = station_registry[station]
+    csv_value = config.get("training_data_path") or station_entry.get("training_file") or station_entry.get("history_file") or station_entry.get("input_file")
+    if not csv_value:
+        raise ValueError(f"Station '{station}' has no training_file or input_file configured.")
+    csv_path = Path(csv_value)
+    if not csv_path.is_absolute():
+        csv_path = ROOT / csv_path
+    csv_path = csv_path.resolve()
+
+    model_cfg = load_yaml(ROOT / "config" / "model.yaml")
+    contract = station_forecast_contract(station_entry, model_cfg)
+    history_steps = int(contract["history_steps"])
+    horizon_steps = int(contract["horizon_steps"])
+    interval_minutes = int(contract["interval_minutes"])
+
+    validation_fraction = float(training_options.get("validation_fraction", 0.15))
+    if not 0.05 <= validation_fraction <= 0.40:
+        raise ValueError("validation_fraction must be between 0.05 and 0.40.")
+
+    frame = load_station_csv(csv_path, interval_minutes=interval_minutes)
+    managed = bool(station_entry.get("weather"))
+    with_test = bool(station_entry.get("replay_start_date"))
+    if with_test:
+        cutoff = pd.Timestamp(station_entry["replay_start_date"], tz="UTC")
+        frame = frame.loc[frame["utc_timestamp"] < cutoff].reset_index(drop=True)
+    weather_columns = ["forecast_temperature"] if managed else []
+    if managed:
+        frame = archived_weather_history(frame, weather_columns, history_steps)
+    n_rows = len(frame)
+    origin_groups, split_row, validation_end_row = forecast_split_origins(
+        frame, history_steps, horizon_steps, interval_minutes, validation_fraction, with_test, weather_columns,
+    )
+    train_origins = sample_origins(origin_groups[0], int(parameters.get("max_train_origins", 300)))
+    max_eval = int(parameters.get("max_validation_origins", 80))
+    validation_origins = sample_origins(origin_groups[1], max_eval)
+    if len(train_origins) < 2:
+        raise ValueError("Not enough training forecast origins after sampling.")
+
+    def weekly_predictions(origins: np.ndarray) -> np.ndarray:
+        return np.concatenate([
+            weekly_demand_baseline(frame.iloc[start - history_steps:start], horizon_steps, interval_minutes)
+            for start in origins
+        ])
+
+    x_train, y_train, train_origin_ids = build_training_examples(
+        frame, train_origins, history_steps, horizon_steps, interval_minutes, use_forecast_weather=managed
+    )
+    x_valid, y_valid, valid_origin_ids = build_training_examples(
+        frame, validation_origins, history_steps, horizon_steps, interval_minutes, use_forecast_weather=managed
+    )
+    feature_names = list(x_train.columns)
+    x_valid = x_valid.reindex(columns=feature_names)
+    if x_train.isna().any().any() or x_valid.isna().any().any():
+        raise ValueError("Training feature matrix contains missing values.")
+
+    estimator = build_estimator(algorithm, parameters)
+    started = time.perf_counter()
+    estimator.fit(x_train.to_numpy(dtype=np.float32), y_train)
+    estimator_fit_seconds = time.perf_counter() - started
+
+    latency_started = time.perf_counter()
+    predicted = estimator.predict(x_valid.to_numpy(dtype=np.float32))
+    inference_latency_ms = (time.perf_counter() - latency_started) * 1000.0 / max(1, len(validation_origins))
+    predicted = np.asarray(predicted, dtype=float).reshape(-1)
+    if len(predicted) != len(y_valid):
+        raise RuntimeError(f"Estimator returned {len(predicted)} predictions for {len(y_valid)} validation rows.")
+    blend = {}
+    if managed and algorithm == "dense_nn" and weekly_demand_baseline(
+        frame.iloc[train_origins[0] - history_steps:train_origins[0]], horizon_steps, interval_minutes
+    ) is not None:
+        weekly = weekly_predictions(validation_origins)
+        weight = min((0.0, 0.25, 0.5, 0.75, 1.0),
+                     key=lambda value: mean_absolute_error(y_valid, apply_demand_blend(predicted, weekly, value)))
+        blend = {
+            "weekly_blend_model_weight": weight,
+            "unblended_validation_metrics": calculate_metrics(y_valid, np.maximum(0.0, predicted)),
+            "weekly_validation_metrics": calculate_metrics(y_valid, weekly),
+        }
+        predicted = apply_demand_blend(predicted, weekly, weight)
+    metrics = calculate_metrics(y_valid, predicted)
+
+    # Error profile by lead step is part of the experiment and comparison output.
+    horizon_metrics = []
+    predicted_matrix = predicted.reshape(len(validation_origins), horizon_steps)
+    actual_matrix = y_valid.reshape(len(validation_origins), horizon_steps)
+    for lead in range(horizon_steps):
+        lead_metrics = calculate_metrics(actual_matrix[:, lead], predicted_matrix[:, lead])
+        horizon_metrics.append({"horizon_step": lead + 1, **lead_metrics})
+
+    validation_start = str(pd.Timestamp(frame.iloc[split_row]["utc_timestamp"]).isoformat())
+    validation_end = str(pd.Timestamp(frame.iloc[validation_end_row - 1]["utc_timestamp"]).isoformat())
+    test_metadata = {}
+    if with_test:
+        test_origins = sample_origins(origin_groups[2], max_eval)
+        x_test, y_test, _ = build_training_examples(
+            frame, test_origins, history_steps, horizon_steps, interval_minutes, use_forecast_weather=managed,
+        )
+        x_test = x_test.reindex(columns=feature_names)
+        test_predicted = estimator.predict(x_test.to_numpy(dtype=np.float32))
+        test_baselines = {}
+        if blend:
+            weekly = weekly_predictions(test_origins)
+            test_baselines = {
+                "unblended_test_metrics": calculate_metrics(y_test, np.maximum(0.0, test_predicted)),
+                "weekly_test_metrics": calculate_metrics(y_test, weekly),
+            }
+            test_predicted = apply_demand_blend(test_predicted, weekly, blend["weekly_blend_model_weight"])
+        test_metadata = {
+            **test_baselines,
+            "test_metrics": calculate_metrics(y_test, test_predicted),
+            "test_origin_count": len(test_origins),
+            "test_start_utc": frame["utc_timestamp"].iloc[validation_end_row].isoformat(),
+            "test_end_utc": frame["utc_timestamp"].iloc[-1].isoformat(),
+        }
+
+    training_seconds = time.perf_counter() - overall_started
+    created = utc_now()
+    version = next_version(station, algorithm)
+    artifact_dir = ROOT / "models" / station / "experiments" / experiment_id
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact_path = artifact_dir / "model.joblib"
+    metadata_path = artifact_dir / "metadata.json"
+    joblib.dump(estimator, artifact_path, compress=3)
+
+    metadata = {
+        "experiment_id": experiment_id,
+        "station": station,
+        "region_name": station,
+        "algorithm": algorithm,
+        "version": version,
+        "artifact_path": artifact_path.relative_to(ROOT).as_posix(),
+        "metadata_path": metadata_path.relative_to(ROOT).as_posix(),
+        "feature_schema": FEATURE_SCHEMA,
+        "feature_names": feature_names,
+        "history_steps": history_steps,
+        "horizon_steps": horizon_steps,
+        "interval_minutes": interval_minutes,
+        "history_window_hours": contract["history_window_hours"],
+        "forecast_horizon_hours": contract["forecast_horizon_hours"],
+        "training_rows": int(n_rows),
+        "eligible_origins_by_split": [len(origins) for origins in origin_groups],
+        "training_origins": int(len(train_origins)),
+        "training_samples": int(len(y_train)),
+        "validation_origins": int(len(validation_origins)),
+        "validation_origin_count": int(len(validation_origins)),
+        "validation_samples": int(len(y_valid)),
+        "training_start_utc": str(pd.Timestamp(frame.iloc[0]["utc_timestamp"]).isoformat()),
+        "training_end_utc": str(pd.Timestamp(frame.iloc[split_row - 1]["utc_timestamp"]).isoformat()),
+        "validation_start_utc": validation_start,
+        "validation_end_utc": validation_end,
+        "validation_fraction": validation_fraction,
+        "evaluation_protocol": "chronological_train_validation_test_sampled_origins_v1"
+        if with_test else "chronological_holdout_sampled_origins_v1",
+        **blend,
+        **test_metadata,
+        "parameters": parameters,
+        "metrics": metrics,
+        "horizon_metrics": horizon_metrics,
+        "training_duration_seconds": float(training_seconds),
+        "estimator_fit_seconds": float(estimator_fit_seconds),
+        "inference_latency_ms_per_origin": float(inference_latency_ms),
+        "model_size_bytes": int(artifact_path.stat().st_size),
+        "training_csv": csv_path.relative_to(ROOT).as_posix() if csv_path.is_relative_to(ROOT) else str(csv_path),
+        "created_at": created,
+        "weather_mode": FORECAST_WEATHER_MODE if managed else "last_observed_temperature_persistence",
+        "weather_source": "open_meteo_day_ahead" if managed else "uploaded_historical",
+    }
+    metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    registry_record = {
+        "experiment_id": experiment_id,
+        "station": station,
+        "algorithm": algorithm,
+        "version": version,
+        "status": "candidate",
+        "artifact_path": metadata["artifact_path"],
+        "metadata_path": metadata["metadata_path"],
+        "feature_schema": FEATURE_SCHEMA,
+        "history_steps": history_steps,
+        "horizon_steps": horizon_steps,
+        "interval_minutes": interval_minutes,
+        "validation_start_utc": validation_start,
+        "validation_end_utc": validation_end,
+        "validation_origin_count": int(len(validation_origins)),
+        "evaluation_protocol": metadata["evaluation_protocol"],
+        **blend,
+        **test_metadata,
+        "parameters": parameters,
+        "metrics": metrics,
+        "training_duration_seconds": float(training_seconds),
+        "estimator_fit_seconds": float(estimator_fit_seconds),
+        "inference_latency_ms_per_origin": float(inference_latency_ms),
+        "model_size_bytes": int(artifact_path.stat().st_size),
+        "created_at": created,
+    }
+    upsert_experiment(registry_record)
+    return metadata

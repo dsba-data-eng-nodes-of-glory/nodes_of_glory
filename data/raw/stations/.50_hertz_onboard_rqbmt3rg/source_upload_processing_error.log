@@ -1,0 +1,14 @@
+Traceback (most recent call last):
+  File "C:\Users\hp\Documents\Nodes of Glory\Performance upgrade\scripts\raw_spark_preprocessor.py", line 1518, in main_spark
+    _spark_write_csv(spark, tagged, 'impute',
+  File "C:\Users\hp\Documents\Nodes of Glory\Performance upgrade\scripts\raw_spark_preprocessor.py", line 1429, in _spark_write_csv
+    frame.write.mode('overwrite').option('header', 'true').option('compression', 'none').csv(output.as_uri())
+  File "C:\Users\hp\Anaconda3\envs\electricity-spark\lib\site-packages\pyspark\sql\readwriter.py", line 1864, in csv
+    self._jwrite.csv(path)
+  File "C:\Users\hp\Anaconda3\envs\electricity-spark\lib\site-packages\py4j\java_gateway.py", line 1322, in __call__
+    return_value = get_return_value(
+  File "C:\Users\hp\Anaconda3\envs\electricity-spark\lib\site-packages\pyspark\errors\exceptions\captured.py", line 179, in deco
+    return f(*a, **kw)
+  File "C:\Users\hp\Anaconda3\envs\electricity-spark\lib\site-packages\py4j\protocol.py", line 334, in get_return_value
+    raise Py4JError(
+py4j.protocol.Py4JError: An error occurred while calling o185.csv

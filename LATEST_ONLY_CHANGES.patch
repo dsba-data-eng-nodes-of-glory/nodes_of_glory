@@ -1,0 +1,138 @@
+--- a/dashboard/pages/station_management.py
++++ b/dashboard/pages/station_management.py
+@@ -423,30 +423,44 @@
+             st.error(f"Could not retrieve the data-quality review: {exc}")
+ 
+ 
+-# The source of truth is FastAPI's durable onboarding-job database, not
+-# Streamlit session state. Reopening this page shows the same jobs.
++# The backend preserves audit history, but the customer-facing panel shows
++# only the newest registration. Terminal results are shown in the browser
++# session that submitted or followed that job, never from older sessions.
+ st.subheader("Registration and model deployment progress")
++
++
++def _latest_visible_registration(jobs: list[dict], watched_id: str | None) -> dict | None:
++    if not jobs:
++        return None
++    latest = jobs[0]  # API returns newest first; no historical job selector.
++    running = {"queued", "processing", "awaiting_confirmation", "cancelling", "training"}
++    if latest.get("status") in running or latest.get("id") == watched_id:
++        return latest
++    return None
+ 
+ 
+ def _render_onboarding_jobs():
+     try:
+-        jobs = api_get("/stations/onboard/jobs?limit=12").get("jobs", [])
++        jobs = api_get("/stations/onboard/jobs?limit=1").get("jobs", [])
+     except requests.RequestException as exc:
+-        st.warning(f"Cannot retrieve background registration progress: {exc}")
++        st.warning(f"Cannot retrieve registration progress: {exc}")
+         return
+-    if not jobs:
+-        st.caption("No recent station registrations. Submitted jobs will appear here.")
++    latest = _latest_visible_registration(jobs, st.session_state.get("onboarding_job_id"))
++    if latest is None:
++        st.session_state.pop("quality_dialog_job_id", None)
++        st.session_state.pop("_latest_registration_id", None)
++        st.caption("No registration is running. Submit a raw file to view its progress here.")
+         return
+-    watched = st.session_state.get("onboarding_job_id")
+-    waiting = next((j for j in jobs if j.get("status") == "awaiting_confirmation"), None)
+-    chosen = next((j for j in jobs if j["id"] == watched), waiting or jobs[0])
+-    choices = [j["id"] for j in jobs]
+-    selected_job_id = st.selectbox(
+-        "Registration job", choices, index=choices.index(chosen["id"]),
+-        format_func=lambda job_id: next(
+-            f"{j['station']} · {j['status'].replace('_', ' ').title()}" for j in jobs if j["id"] == job_id),
+-        key="selected_onboarding_job",
+-    )
++    selected_job_id = latest["id"]
++    st.session_state["_latest_registration_id"] = selected_job_id
++    # A refreshed browser can follow a still-running job through to completion.
++    if latest.get("status") in {"queued", "processing", "awaiting_confirmation", "cancelling", "training"}:
++        st.session_state["onboarding_job_id"] = selected_job_id
++    # Never open an older job's quality dialog after a new upload.
++    if st.session_state.get("quality_dialog_job_id") not in (None, selected_job_id):
++        st.session_state.pop("quality_dialog_job_id", None)
++    st.caption(f"Latest registration: {latest.get('station', 'Station')} · "
++               f"{latest.get('status', 'unknown').replace('_', ' ').title()}")
+     try:
+         job = api_get(f"/stations/onboard/jobs/{selected_job_id}")
+     except requests.RequestException as exc:
+@@ -542,6 +556,12 @@
+         else:
+             st.caption("No recorded events")
+     st.caption(f"Last backend update: {job.get('updated', '—')} · Job ID: {job['id'][:12]}")
++    if state in {"completed", "failed", "interrupted", "cancelled"}:
++        if st.button("Dismiss latest result", key=f"dismiss_onboarding_{selected_job_id}"):
++            st.session_state.pop("onboarding_job_id", None)
++            st.session_state.pop("quality_dialog_job_id", None)
++            st.session_state.pop("_latest_registration_id", None)
++            rerun_page()
+ 
+ 
+ if hasattr(st, "fragment"):
+@@ -552,6 +572,9 @@
+ # Called in the main script, outside the polling fragment. st.dialog behaves
+ # like a fragment, so nesting it inside the polling fragment is unsafe.
+ _quality_popup_id = st.session_state.get("quality_dialog_job_id")
++if _quality_popup_id != st.session_state.get("_latest_registration_id"):
++    st.session_state.pop("quality_dialog_job_id", None)
++    _quality_popup_id = None
+ if _quality_popup_id:
+     if hasattr(st, "dialog"):
+         _quality_review_dialog(_quality_popup_id)
+--- a/dashboard/ui.py
++++ b/dashboard/ui.py
+@@ -265,26 +265,26 @@
+         try:
+             response = requests.get(
+                 f"{(st.session_state.get('ef_api_url') or API_DEFAULT).rstrip('/')}/stations/onboard/jobs",
+-                params={"limit": 10}, timeout=(1, 2.5),
++                params={"limit": 1}, timeout=(1, 2.5),
+             )
+             if response.status_code != 200:
+                 return
+             jobs = response.json().get("jobs", [])
+         except (requests.RequestException, ValueError):
+             return
+-        pending_confirmation = [j for j in jobs if j.get("status") == "awaiting_confirmation"]
+-        active = [j for j in jobs if j.get("status") in
+-                  {"queued", "processing", "awaiting_confirmation", "cancelling", "training"}]
+-        if not active:
++        if not jobs:
+             return
+-        if pending_confirmation:
+-            names = ", ".join(j["station"] for j in pending_confirmation[:3])
+-            st.warning(f"⚠️ Data-quality approval required for {names}. "
++        latest = jobs[0]
++        status = latest.get("status")
++        # Show only the current/latest registration, not older interrupted jobs.
++        if status == "awaiting_confirmation":
++            st.warning(f"⚠️ Data-quality approval required for {latest['station']}. "
+                        "Registration and training are paused until you confirm or cancel.")
+-        others = [j for j in active if j.get("status") != "awaiting_confirmation"]
+-        if others:
+-            parts = [f"{job['station']}: {job.get('message', job['status'])}" for job in others[:3]]
+-            st.info("⚙️ Registration running in FastAPI · " + "  |  ".join(parts))
++        elif status in {"queued", "processing", "cancelling", "training"}:
++            st.info(f"⚙️ Registration running in FastAPI · {latest['station']}: "
++                    f"{latest.get('message', status)}")
++        else:
++            return
+         if active_page != "stations":
+             try:
+                 st.page_link("pages/station_management.py", label="View registration and deployment progress")
+--- a/backend/onboarding_jobs.py
++++ b/backend/onboarding_jobs.py
+@@ -199,7 +199,7 @@
+ 
+ def recent_jobs(limit: int = 10) -> list[dict]:
+     with _LOCK, _connect() as db:
+-        rows = db.execute("SELECT * FROM jobs ORDER BY created DESC LIMIT ?", (min(max(limit, 1), 50),)).fetchall()
++        rows = db.execute("SELECT * FROM jobs ORDER BY created DESC, rowid DESC LIMIT ?", (min(max(limit, 1), 50),)).fetchall()
+     result = []
+     for r in rows:
+         job = _training_update(_mark_interrupted(_record(r)))

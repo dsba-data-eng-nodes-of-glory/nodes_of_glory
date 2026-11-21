@@ -1,0 +1,7 @@
+{
+  "station_id": "tennet",
+  "source_file": "C:\\Users\\hp\\Documents\\Nodes of Glory\\Performance upgrade\\data\\raw\\stations\\tennet\\tennet_demand_stream.csv",
+  "topic": "tennet-raw",
+  "last_acked_timestamp": "2026-10-07T05:30:00+00:00",
+  "updated_at_utc": "2026-11-21T13:04:29.651573+00:00"
+}

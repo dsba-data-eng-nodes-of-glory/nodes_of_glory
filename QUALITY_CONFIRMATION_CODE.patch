@@ -1,0 +1,566 @@
+--- a/backend/onboarding_jobs.py
++++ b/backend/onboarding_jobs.py
+@@ -16,6 +16,7 @@
+ import os
+ import sqlite3
+ import threading
++import time
+ import traceback
+ import uuid
+ from datetime import date, datetime, timezone
+@@ -31,10 +32,17 @@
+ # Avoid overlapping standalone Spark cleans / weather cache writers on 8 GB laptops.
+ _SEMAPHORE = threading.Semaphore(1)
+ _PROGRESS = contextvars.ContextVar("onboarding_progress_callback", default=None)
+-ACTIVE = {"queued", "processing", "training"}
++_JOB_CONTEXT = contextvars.ContextVar("onboarding_quality_job", default=None)
++_QUALITY_TIMEOUT_SECONDS = 3600  # Prevent an unattended review from holding raw data in RAM indefinitely.
++
++
++class RegistrationDeclined(Exception):
++    """Customer declined the quality warning or the approval window expired."""
++
++ACTIVE = {"queued", "processing", "awaiting_confirmation", "cancelling", "training"}
+ STAGES = {
+     "accepted": 1, "waiting": 2, "validation": 3, "spark": 4,
+-    "quality": 5, "weather": 6, "preparation": 7, "registry": 8,
++    "quality": 5, "quality_review": 5, "weather": 6, "preparation": 7, "registry": 8,
+     "topics": 9, "training": 10, "completed": 11,
+ }
+ 
+@@ -61,6 +69,11 @@
+         upload_path TEXT NOT NULL, original_name TEXT NOT NULL,
+         parameters TEXT NOT NULL, result TEXT, error TEXT
+     )""")
++    # Separate table retains the original jobs schema and old INSERT clients.
++    db.execute("""CREATE TABLE IF NOT EXISTS quality_reviews (
++        job_id TEXT PRIMARY KEY, report TEXT NOT NULL,
++        decision TEXT, updated TEXT NOT NULL
++    )""")
+     db.execute("""CREATE TABLE IF NOT EXISTS events (
+         id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL,
+         created TEXT NOT NULL, stage TEXT NOT NULL, message TEXT NOT NULL
+@@ -88,6 +101,11 @@
+         callback(stage, message)
+ 
+ 
++def in_onboarding_job() -> bool:
++    """True only for a backend-owned registration job requiring quality approval."""
++    return _JOB_CONTEXT.get() is not None
++
++
+ def _record(row: sqlite3.Row) -> dict:
+     result = dict(row)
+     result["result"] = json.loads(result.pop("result") or "{}")
+@@ -111,7 +129,7 @@
+ 
+ def _training_update(job: dict) -> dict:
+     # Continue to expose per-model details after completion/failure as well.
+-    if job["status"] in {"queued", "processing", "interrupted"}:
++    if job["status"] in {"queued", "processing", "awaiting_confirmation", "cancelling", "interrupted", "cancelled"}:
+         return job
+     config = read_station_config()
+     entry = (config.get("stations") or {}).get(job["station"])
+@@ -155,7 +173,7 @@
+ def _mark_interrupted(job: dict) -> dict:
+     with _LOCK, _connect() as db:
+         row = db.execute("SELECT run_id FROM jobs WHERE id=?", (job["id"],)).fetchone()
+-    if row and row["run_id"] != _RUN_ID and job["status"] in {"queued", "processing"}:
++    if row and row["run_id"] != _RUN_ID and job["status"] in {"queued", "processing", "awaiting_confirmation", "cancelling"}:
+         msg = "FastAPI restarted during registration. Check station registry before resubmitting."
+         _change(job["id"], "interrupted", "interrupted", msg, error=msg)
+         job.update(status="interrupted", stage="interrupted", message=msg, error=msg)
+@@ -172,6 +190,9 @@
+     with _LOCK, _connect() as db:
+         events = [dict(r) for r in db.execute(
+             "SELECT created,stage,message FROM events WHERE job_id=? ORDER BY id DESC LIMIT 40", (job_id,))]
++        review_row = db.execute("SELECT report,decision FROM quality_reviews WHERE job_id=?", (job_id,)).fetchone()
++    job["quality_review"] = json.loads(review_row["report"]) if review_row else {}
++    job["quality_decision"] = review_row["decision"] if review_row else None
+     job["events"] = list(reversed(events))
+     return job
+ 
+@@ -184,6 +205,80 @@
+         job = _training_update(_mark_interrupted(_record(r)))
+         result.append(job)
+     return result
++
++
++def decide_quality_confirmation(job_id: str, *, approved: bool) -> dict:
++    """Atomic, single-use approval endpoint. A decision is not a UI-only flag."""
++    with _LOCK, _connect() as db:
++        row = db.execute("SELECT station,status,run_id FROM jobs WHERE id=?", (job_id,)).fetchone()
++        review = db.execute("SELECT report,decision FROM quality_reviews WHERE job_id=?", (job_id,)).fetchone()
++        if row is None:
++            raise HTTPException(404, "Onboarding job not found")
++        if row["status"] != "awaiting_confirmation" or (review and review["decision"] is not None):
++            raise HTTPException(409, "This job is no longer awaiting quality approval")
++        if row["run_id"] != _RUN_ID:
++            raise HTTPException(409, "Backend restarted; the quality review must be rerun")
++        if not review or not review["report"]:
++            raise HTTPException(409, "Quality review is not ready")
++        action = "approved" if approved else "declined"
++        now = _utc()
++        db.execute("UPDATE quality_reviews SET decision=?,updated=? WHERE job_id=?", (action, now, job_id))
++        db.execute("UPDATE jobs SET updated=?,message=? WHERE id=?",
++                   (now, "Quality review accepted; resuming registration" if approved
++                    else "Customer declined registration; cleaning up unregistered files", job_id))
++        db.execute("INSERT INTO events(job_id,created,stage,message) VALUES(?,?,?,?)",
++                   (job_id, now, "quality_review", "Customer " + action + " the data-quality review"))
++        db.commit()
++    return {"job_id": job_id, "station": row["station"], "decision": action}
++
++
++def _wait_for_quality_decision(job_id: str, quality_review: dict) -> None:
++    """Pause before any weather, registry or model side effects.
++
++    Release the *single-station Spark* semaphore while the customer decides;
++    other uploads are not blocked by an unattended confirmation dialog.
++    """
++    with _LOCK, _connect() as db:
++        now = _utc()
++        db.execute("INSERT INTO quality_reviews(job_id,report,decision,updated) VALUES(?,?,NULL,?) "
++                   "ON CONFLICT(job_id) DO UPDATE SET report=excluded.report,decision=NULL,updated=excluded.updated",
++                   (job_id, json.dumps(quality_review), now))
++        db.execute("UPDATE jobs SET status='awaiting_confirmation',stage='quality_review',"
++                   "message=?,updated=? WHERE id=?",
++                   ("Waiting for customer review of Spark quality findings", now, job_id))
++        db.execute("INSERT INTO events(job_id,created,stage,message) VALUES(?,?,?,?)",
++                   (job_id, now, "quality_review", "Spark audit ready; awaiting explicit customer confirmation"))
++        db.commit()
++    _SEMAPHORE.release()
++    try:
++        deadline = time.monotonic() + _QUALITY_TIMEOUT_SECONDS
++        while time.monotonic() < deadline:
++            with _LOCK, _connect() as db:
++                row = db.execute("SELECT decision FROM quality_reviews WHERE job_id=?", (job_id,)).fetchone()
++            if row is None:
++                raise RegistrationDeclined("Registration job no longer exists")
++            if row["decision"] == "approved":
++                return
++            if row["decision"] == "declined":
++                raise RegistrationDeclined("Customer declined the data-quality review; station not registered")
++            time.sleep(0.25)
++        raise RegistrationDeclined("Quality confirmation expired after one hour; station not registered")
++    finally:
++        _SEMAPHORE.acquire()
++
++
++async def request_quality_confirmation(quality_review: dict) -> None:
++    """Only background-job submissions can continue after explicit customer review.
++
++    Historical direct-onboard clients are not implicitly approved by this function;
++    the customer portal always uses the background-job endpoint.
++    """
++    job_id = _JOB_CONTEXT.get()
++    if job_id is None:
++        # Disallow bypass of the quality review through the legacy raw endpoint.
++        raise HTTPException(409, "Raw registration requires /stations/onboard/jobs and quality approval")
++    await asyncio.to_thread(_wait_for_quality_decision, job_id, quality_review)
++    _change(job_id, "processing", "quality", "Quality approved; proceeding to weather and data preparation")
+ 
+ 
+ async def enqueue_job(*, station: str, upload: UploadFile, values: dict[str, str]) -> dict:
+@@ -240,6 +335,7 @@
+         station = row["station"]
+         _change(job_id, "processing", "validation", "Validating registration settings")
+         token = _PROGRESS.set(lambda stage, text: _change(job_id, "processing", stage, text))
++        quality_token = _JOB_CONTEXT.set(job_id)
+         try:
+             from backend.station_api import onboard_station
+             parameters = json.loads(row["parameters"])
+@@ -268,6 +364,10 @@
+             # The original source is now archived in the registered station folder;
+             # do not retain a second 200 MB copy for every successful upload.
+             Path(row["upload_path"]).unlink(missing_ok=True)
++        except RegistrationDeclined as exc:
++            # Customer cancellation must not leave the uploaded raw source behind.
++            Path(row["upload_path"]).unlink(missing_ok=True)
++            _change(job_id, "cancelled", "cancelled", str(exc))
+         except Exception as exc:
+             text = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
+             _change(job_id, "failed", "failed", text, error=text)
+@@ -276,3 +376,4 @@
+             logging.getLogger(__name__).exception("Onboarding failed for %s", station)
+         finally:
+             _PROGRESS.reset(token)
++            _JOB_CONTEXT.reset(quality_token)
+--- a/backend/station_api.py
++++ b/backend/station_api.py
+@@ -36,7 +36,14 @@
+ from src.models.evaluation_splits import archived_weather_history, forecast_split_origins
+ from src.storage.station_hierarchy import build_tree, parse_path, validate_path
+ from backend.onboarding_training import DEFAULT_MODELS, initial_training, training_pending
+-from backend.onboarding_jobs import progress as onboarding_progress
++from backend.onboarding_jobs import (
++    progress as onboarding_progress,
++    request_quality_confirmation,
++    decide_quality_confirmation,
++    RegistrationDeclined,
++    in_onboarding_job,
++)
++from backend.onboarding_quality import build_quality_review
+ 
+ router = APIRouter(prefix="/stations", tags=["stations"])
+ 
+@@ -261,6 +268,15 @@
+ def get_station_onboarding_job(job_id: str):
+     from backend.onboarding_jobs import get_job
+     return get_job(job_id)
++
++
++@router.post("/onboard/jobs/{job_id}/quality-decision")
++async def submit_onboarding_quality_decision(job_id: str, request: Request):
++    """Only the station's explicitly confirmed quality review releases registration."""
++    payload = await request.json()
++    if not isinstance(payload, dict) or type(payload.get("approved")) is not bool:
++        raise HTTPException(422, detail="Submit {\"approved\": true or false")
++    return decide_quality_confirmation(job_id, approved=payload["approved"])
+ 
+ 
+ @router.get("/onboard/jobs/{job_id}/spark-log")
+@@ -343,6 +359,11 @@
+                        and not weather_locations.strip() else "raw")
+     if numeric_locale not in {"de", "en"}:
+         raise HTTPException(status_code=422, detail="Number locale must be de or en.")
++    if upload_mode == "raw" and not in_onboarding_job():
++        raise HTTPException(status_code=409, detail=(
++            "For raw uploads use /stations/onboard/jobs. Customer quality confirmation "
++            "is required before station registration or model deployment."
++        ))
+ 
+     config = read_station_config()
+     stations = config.setdefault("stations", {})
+@@ -448,6 +469,12 @@
+                 raise ValueError("Kafka live input requires the Station Location worksheet.")
+             if weather_config and horizon_steps * interval_minutes > 1440:
+                 raise ValueError("Archived day-ahead weather supports forecast horizons up to 24 hours.")
++            # Hold registration BEFORE external weather requests, registry writes,
++            # Kafka topic creation and model training. Spark hard rejections above
++            # remain non-overridable; accepted warning datasets need explicit consent.
++            if upload_mode == "raw":
++                quality_review = build_quality_review(raw_quality_report, key)
++                await request_quality_confirmation(quality_review)
+             if weather_config:
+                 onboarding_progress("weather", "Fetching/caching historical and forecast weather for the confirmed locations")
+                 weather = await run_in_threadpool(station_weather, ROOT, key, {"weather": weather_config})
+@@ -739,7 +766,7 @@
+             "stream_start_utc": station_entry.get("stream_start_utc"),
+             "next_step": "Initial training and model deployment run automatically. Activate the station when it is ready.",
+         }
+-    except HTTPException:
++    except (HTTPException, RegistrationDeclined):
+         raise
+     except Exception as exc:
+         raise HTTPException(status_code=422, detail=f"Station onboarding failed: {exc}") from exc
+--- a/dashboard/pages/station_management.py
++++ b/dashboard/pages/station_management.py
+@@ -296,7 +296,7 @@
+         raw_topic = st.text_input("Raw topic (automatic if empty)", placeholder="tennet-raw")
+     with topic_col2:
+         featured_topic = st.text_input("Featured topic (automatic if empty)", placeholder="tennet-featured")
+-    submitted = st.form_submit_button("Process raw file and register station", type="primary")
++    submitted = st.form_submit_button("Validate raw file and review quality", type="primary")
+ 
+ if submitted:
+     if not station_id or uploaded is None:
+@@ -343,7 +343,8 @@
+             )
+             st.session_state["onboarding_job_id"] = result["job_id"]
+             st.session_state["registered_station_selection"] = result["station"]
+-            st.success(f"Upload accepted for {result['station']}. Background registration started.")
++            st.success(f"Upload accepted for {result['station']}. Spark validation has started. "
++                       "Training will begin only after you approve the quality review.")
+             rerun_page()
+         except requests.HTTPError as exc:
+             try:
+@@ -353,6 +354,74 @@
+             st.error(f"Station registration failed: {detail}")
+         except requests.RequestException as exc:
+             st.error(f"Station registration failed: {exc}")
++
++# The customer must explicitly approve a Spark-accepted dataset before
++# weather download, station registration and model deployment begin.
++def _render_quality_review(job: dict) -> None:
++    review = job.get("quality_review") or {}
++    if job.get("status") != "awaiting_confirmation" or not review:
++        st.info("This registration is not currently awaiting confirmation.")
++        return
++    st.markdown(f"**Station:** {job['station']} · **Validated rows:** {review.get('rows', 0):,}")
++    if review.get("training_risk"):
++        st.warning("⚠️ **Potential model-quality compromise.** " + review.get("summary", ""))
++        if not review.get("training_ready", False):
++            st.error("Spark accepted the source, but marked it NOT training-ready. "
++                     "Continuing does not guarantee usable model performance.")
++    else:
++        st.success("Spark accepted the dataset without quality warnings.")
++    st.caption("The Spark hard-rejection rules cannot be overridden. This review applies only to accepted data.")
++    issues = review.get("issues") or []
++    if issues:
++        st.dataframe(pd.DataFrame([
++            {"Severity": issue.get("severity", "warning").upper(),
++             "Issue": issue.get("title", ""),
++             "Finding / effect": issue.get("detail", "")}
++            for issue in issues]), hide_index=True, use_container_width=True)
++    else:
++        st.info("No unresolved findings in the Spark quality report.")
++    st.markdown("**Before you proceed**")
++    st.write(review.get("approval_statement") or
++             "I understand data-quality warnings could compromise model accuracy.")
++    st.caption("Until you approve, no weather fetch, station registry entry, Kafka topic or model training is started.")
++    acknowledged = st.checkbox(
++        "I understand the data-quality risks and want to continue with registration and model deployment.",
++        value=False, key=f"quality_ack_{job['id']}",
++    )
++    yes, no = st.columns(2)
++    with yes:
++        if st.button("Confirm and continue", disabled=not acknowledged, type="primary",
++                     use_container_width=True, key=f"quality_yes_{job['id']}"):
++            try:
++                api_post(f"/stations/onboard/jobs/{job['id']}/quality-decision",
++                         json={"approved": True}, timeout=15)
++                st.session_state.pop("quality_dialog_job_id", None)
++                st.success("Approval recorded. Backend processing will resume.")
++                rerun_page()
++            except requests.RequestException as exc:
++                st.error(f"Could not confirm approval: {exc}")
++    with no:
++        if st.button("Cancel registration", use_container_width=True,
++                     key=f"quality_no_{job['id']}"):
++            try:
++                api_post(f"/stations/onboard/jobs/{job['id']}/quality-decision",
++                         json={"approved": False}, timeout=15)
++                st.session_state.pop("quality_dialog_job_id", None)
++                st.info("Cancellation recorded. No station will be registered.")
++                rerun_page()
++            except requests.RequestException as exc:
++                st.error(f"Could not cancel registration: {exc}")
++
++
++if hasattr(st, "dialog"):
++    @st.dialog("Data quality review — approve before model training")
++    def _quality_review_dialog(job_id: str):
++        try:
++            job = api_get(f"/stations/onboard/jobs/{job_id}")
++            _render_quality_review(job)
++        except requests.RequestException as exc:
++            st.error(f"Could not retrieve the data-quality review: {exc}")
++
+ 
+ # The source of truth is FastAPI's durable onboarding-job database, not
+ # Streamlit session state. Reopening this page shows the same jobs.
+@@ -369,7 +438,8 @@
+         st.caption("No recent station registrations. Submitted jobs will appear here.")
+         return
+     watched = st.session_state.get("onboarding_job_id")
+-    chosen = next((j for j in jobs if j["id"] == watched), jobs[0])
++    waiting = next((j for j in jobs if j.get("status") == "awaiting_confirmation"), None)
++    chosen = next((j for j in jobs if j["id"] == watched), waiting or jobs[0])
+     choices = [j["id"] for j in jobs]
+     selected_job_id = st.selectbox(
+         "Registration job", choices, index=choices.index(chosen["id"]),
+@@ -385,7 +455,18 @@
+     state = job.get("status", "unknown")
+     st.markdown(f"**{job['station']}** · {job.get('stage', state).replace('_', ' ').title()}")
+     st.caption(job.get("message", ""))
+-    if state in {"queued", "processing", "training"}:
++    if state == "awaiting_confirmation":
++        st.warning("⚠️ Data quality needs your approval. Weather downloads, registration, Kafka setup "
++                   "and training have NOT started. Review the report to proceed or cancel.")
++        if st.button("Review quality findings and decide", key=f"open_quality_{selected_job_id}"):
++            st.session_state["quality_dialog_job_id"] = selected_job_id
++            rerun_page()
++        prompted = st.session_state.setdefault("quality_prompted_job_ids", [])
++        if selected_job_id not in prompted:
++            prompted.append(selected_job_id)
++            st.session_state["quality_dialog_job_id"] = selected_job_id
++            rerun_page()
++    elif state in {"queued", "processing", "training", "cancelling"}:
+         if state == "training" and job.get("models_total"):
+             ready, total = job.get("models_ready", 0), job["models_total"]
+             st.progress(ready / total, text=f"Model deployment: {ready} of {total} complete")
+@@ -395,6 +476,8 @@
+         st.success(job.get("message") or "All selected models deployed. Ready to activate.")
+     elif state in {"failed", "interrupted"}:
+         st.error(job.get("message") or job.get("error") or "Registration interrupted")
++    elif state == "cancelled":
++        st.info("Registration cancelled at customer request. No station or model was deployed.")
+     models = job.get("models") or {}
+     if models:
+         data = [{"Model": name.replace("_", " ").title(),
+@@ -409,6 +492,7 @@
+         ("validation", "Validate inputs"),
+         ("spark", "Spark processing"),
+         ("quality", "Validate cleaned data"),
++        ("quality_review", "Customer quality approval"),
+         ("weather", "Download & align weather"),
+         ("preparation", "Prepare training/replay datasets"),
+         ("registry", "Save station configuration"),
+@@ -423,7 +507,9 @@
+     active_index = stage_order.index(active_stage) if active_stage in stage_order else -1
+     process_rows = []
+     for index, (key, name) in enumerate(stages):
+-        if key not in seen and key not in {"training"}:
++        if key == "quality_review" and state == "awaiting_confirmation":
++            state_text = "Awaiting customer decision"
++        elif key not in seen and key not in {"training"}:
+             state_text = "Not started"  # Some optional stages may be skipped.
+         elif state == "completed":
+             state_text = "Completed" if key in seen else "Not applicable"
+@@ -431,7 +517,7 @@
+             state_text = "Failed" if state == "failed" else "Interrupted"
+         elif key == active_stage or (state == "training" and key == "training"):
+             state_text = "In progress"
+-        elif key in seen and (active_index > index or state in {"training", "failed", "interrupted"}):
++        elif key in seen and (active_index > index or state in {"training", "failed", "interrupted", "cancelled"}):
+             state_text = "Completed"
+         else:
+             state_text = "Pending"
+@@ -462,6 +548,19 @@
+     st.fragment(run_every="2s")(_render_onboarding_jobs)()
+ else:
+     _render_onboarding_jobs()
++
++# Called in the main script, outside the polling fragment. st.dialog behaves
++# like a fragment, so nesting it inside the polling fragment is unsafe.
++_quality_popup_id = st.session_state.get("quality_dialog_job_id")
++if _quality_popup_id:
++    if hasattr(st, "dialog"):
++        _quality_review_dialog(_quality_popup_id)
++    else:
++        st.warning("Review the data-quality findings before continuing.")
++        try:
++            _render_quality_review(api_get(f"/stations/onboard/jobs/{_quality_popup_id}"))
++        except requests.RequestException as exc:
++            st.error(f"Could not retrieve quality review: {exc}")
+ 
+ st.markdown("---")
+ 
+--- a/dashboard/ui.py
++++ b/dashboard/ui.py
+@@ -272,13 +272,19 @@
+             jobs = response.json().get("jobs", [])
+         except (requests.RequestException, ValueError):
+             return
+-        active = [j for j in jobs if j.get("status") in {"queued", "processing", "training"}]
++        pending_confirmation = [j for j in jobs if j.get("status") == "awaiting_confirmation"]
++        active = [j for j in jobs if j.get("status") in
++                  {"queued", "processing", "awaiting_confirmation", "cancelling", "training"}]
+         if not active:
+             return
+-        parts = []
+-        for job in active[:3]:
+-            parts.append(f"{job['station']}: {job.get('message', job['status'])}")
+-        st.info("⚙️ Registration running in FastAPI · " + "  |  ".join(parts))
++        if pending_confirmation:
++            names = ", ".join(j["station"] for j in pending_confirmation[:3])
++            st.warning(f"⚠️ Data-quality approval required for {names}. "
++                       "Registration and training are paused until you confirm or cancel.")
++        others = [j for j in active if j.get("status") != "awaiting_confirmation"]
++        if others:
++            parts = [f"{job['station']}: {job.get('message', job['status'])}" for job in others[:3]]
++            st.info("⚙️ Registration running in FastAPI · " + "  |  ".join(parts))
+         if active_page != "stations":
+             try:
+                 st.page_link("pages/station_management.py", label="View registration and deployment progress")
+--- /dev/null
++++ b/backend/onboarding_quality.py
+@@ -0,0 +1,98 @@
++"""Customer-facing, conservative summary of Spark's raw-file quality audit.
++
++Accepted by Spark does not mean the targets are reliable for forecasting.
++A hard Spark rejection cannot be overridden by this confirmation workflow.
++"""
++from __future__ import annotations
++
++from typing import Any
++
++_LABELS = {
++    "demand": "Demand",
++    "solar_mwh": "Solar generation",
++    "wind_mwh": "Wind Energy generation",
++    "solar_mw": "Solar installed capacity",
++    "wind_mw": "Wind Energy installed capacity",
++}
++
++
++def _nonzero_map(values: Any) -> dict[str, int]:
++    if not isinstance(values, dict):
++        return {}
++    return {str(_LABELS.get(str(k), str(k))): int(v)
++            for k, v in values.items() if isinstance(v, (int, float)) and v > 0}
++
++
++def build_quality_review(report: dict, station: str) -> dict:
++    if not report or not report.get("data_accepted"):
++        raise ValueError("Only Spark-accepted datasets can be submitted for customer review")
++    issues: list[dict] = []
++
++    def add(level: str, title: str, detail: str):
++        issues.append({"severity": level, "title": title, "detail": detail})
++
++    missing_slots = int(report.get("missing_timestamp_slots") or 0)
++    timestamp_pct = float(report.get("missing_timestamp_pct") or 0)
++    if missing_slots:
++        add("warning", "Missing timestamps repaired",
++            f"{missing_slots:,} missing intervals ({timestamp_pct:.2f}%). Confirm the historical baseline is suitable.")
++    missing_targets = report.get("target_missing_pct_before_fill") or {}
++    if isinstance(missing_targets, dict):
++        for metric, pct in missing_targets.items():
++            try:
++                pct = float(pct)
++            except (TypeError, ValueError):
++                continue
++            if pct > 0:
++                add("warning", f"{_LABELS.get(metric, metric)} has missing source readings",
++                    f"{pct:.2f}% were missing/invalid before imputation; evaluation must exclude imputed targets.")
++    duplicates = int(report.get("duplicate_rows_removed") or report.get("duplicate_rows_reconciled") or 0)
++    if duplicates:
++        add("info", "Duplicate timestamps reconciled", f"{duplicates:,} duplicate rows were reconciled.")
++    imputed = _nonzero_map(report.get("imputed_cell_counts"))
++    if imputed:
++        add("warning", "Historical values imputed",
++            ", ".join(f"{name}: {count:,}" for name, count in imputed.items()))
++    unfilled = _nonzero_map(report.get("unfilled_cell_counts"))
++    if unfilled:
++        add("high", "Unfilled measurements remain",
++            ", ".join(f"{name}: {count:,}" for name, count in unfilled.items()))
++    malformed = int(report.get("source_malformed_cells") or 0)
++    if malformed:
++        add("warning", "Malformed source measurements", f"{malformed:,} cells were invalid or malformed.")
++    for key, label in (("solar_generation_exceeds_reported_capacity_intervals", "Solar"),
++                       ("wind_generation_exceeds_reported_capacity_intervals", "Wind Energy")):
++        n = int(report.get(key) or 0)
++        if n:
++            add("high", f"{label} generation exceeds installed capacity",
++                f"{n:,} intervals exceeded the configured capacity tolerance. Verify measurement units and the capacity series before using the trained model.")
++    flatlines = int(report.get("observed_demand_flatline_runs_24h") or 0)
++    if flatlines:
++        add("high", "Unusually long constant Demand", f"{flatlines:,} flatline runs exceeded 24 hours.")
++    if report.get("demand_unit_unverified"):
++        add("warning", "Demand unit not verified", "Confirm whether Demand is MW or MWh per interval.")
++    for warning in (report.get("warnings") or []):
++        warning = str(warning)
++        if warning and not any(warning.lower() in str(i["detail"]).lower() for i in issues):
++            add("warning", "Spark preprocessing warning", warning)
++    risk = bool(issues) or not bool(report.get("training_ready", False))
++    if not report.get("training_ready", False) and not issues:
++        add("high", "Training readiness not established", "Spark accepted the dataset, but marked it not training-ready.")
++
++    return {
++        "station": station,
++        "data_accepted": True,
++        "training_ready": bool(report.get("training_ready", False)),
++        "training_risk": risk,
++        "rows": int(report.get("rows") or 0),
++        "missing_timestamp_pct": round(timestamp_pct, 3),
++        "issues": issues,
++        "warning_count": sum(i["severity"] in {"warning", "high"} for i in issues),
++        "summary": ("Quality concerns may compromise forecast accuracy. Continue only after reviewing the input data."
++                    if risk else "No quality warnings were found; customer approval is still required to proceed."),
++        "approval_statement": (
++            "I reviewed the data-quality findings and understand that training, validation, forecasts, "
++            "and residual-load anomaly results may be less reliable if I proceed. "
++            "I authorize registration, weather enrichment, training and deployment for this station."
++        ),
++    }

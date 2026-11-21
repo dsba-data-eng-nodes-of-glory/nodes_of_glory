@@ -1,0 +1,188 @@
+--- a/backend/station_api.py
++++ b/backend/station_api.py
+@@ -30,6 +30,7 @@
+ from src.ingestion.raw_station_loader import (
+     parse_weather_locations, spark_clean_raw_source, load_cleaned_station_csv,
+ )
++from src.ingestion.station_location_lookup import resolve_places, LocationLookupError
+ from src.models.forecast_weather import ForecastWeatherUnavailable
+ from src.models.forecast_contract import derive_forecast_contract
+ from src.models.evaluation_splits import archived_weather_history, forecast_split_origins
+@@ -204,6 +205,23 @@
+     config = read_station_config()
+     station = config.get("active_station")
+     return {"active_station": station, "available_stations": list(config.get("stations", {}).keys())}
++
++
++class ResolveStationLocationsRequest(BaseModel):
++    # Users enter place names and pick a returned candidate in the UI.
++    locations: list[str]
++
++
++@router.post("/locations/resolve")
++def resolve_station_locations(request: ResolveStationLocationsRequest):
++    """Return geocoding candidates without mutating station configuration.
++
++    Weather downloads still happen only during normal station onboarding.
++    """
++    try:
++        return {"locations": resolve_places(request.locations)}
++    except LocationLookupError as exc:
++        raise HTTPException(status_code=422, detail=str(exc)) from exc
+ 
+ 
+ @router.post("/onboard")
+--- a/dashboard/pages/station_management.py
++++ b/dashboard/pages/station_management.py
+@@ -1,7 +1,11 @@
+ from __future__ import annotations
+ 
+ import requests
++import pandas as pd
+ import streamlit as st
++
++from src.ingestion.station_location_lookup import confirmed_location_lines, LocationLookupError
++from src.ingestion.raw_station_loader import parse_weather_locations
+ 
+ try:
+     from dashboard.ui import setup_page, section_title, render_status_strip
+@@ -88,6 +92,115 @@
+     "Stream input", ["csv_replay", "kafka"],
+     format_func=lambda value: "Historical CSV replay" if value == "csv_replay" else "Live Kafka feed",
+ )
++# ---------------------------------------------------------------------
++# Customer service-area location acceptor (independent of the raw file)
++# ---------------------------------------------------------------------
++st.markdown("**Station service area & weather sampling locations**")
++st.caption(
++    "Enter the cities/places served by this station. The portal finds the coordinates; "
++    "review them before registering. These are weather sampling points, not hierarchy nodes. "
++    "For large coverage areas, add representative places (up to 12)."
++)
++location_entry_mode = st.radio(
++    "Location entry method",
++    ["Search by place name", "Enter coordinates manually"],
++    horizontal=True,
++    key="station_weather_location_mode",
++)
++weather_locations = ""
++if location_entry_mode == "Search by place name":
++    location_names = st.text_area(
++        "Locations served (one place per line)",
++        key="station_service_area_places",
++        placeholder="Dortmund, Germany\nEssen, Germany\nCologne, Germany",
++        help="Enter 1–12 cities, towns or postcodes. Add the country or state after a comma for clarity.",
++    ).strip()
++    place_queries = [line.strip() for line in location_names.splitlines() if line.strip()]
++    if st.button("Find coordinates", key="resolve_station_locations"):
++        st.session_state.pop("station_location_confirmation", None)
++        st.session_state.pop("station_location_lookup", None)
++        if not 1 <= len(place_queries) <= 12:
++            st.error("Enter between 1 and 12 place names before looking up coordinates.")
++        else:
++            try:
++                result = api_post(
++                    "/stations/locations/resolve",
++                    json={"locations": place_queries},
++                    timeout=(5, 120),
++                )
++                st.session_state["station_location_lookup"] = {
++                    "source": location_names,
++                    "locations": result["locations"],
++                }
++            except requests.HTTPError as exc:
++                try:
++                    detail = exc.response.json().get("detail", exc.response.text)
++                except (ValueError, AttributeError):
++                    detail = str(exc)
++                st.error(f"Could not resolve locations: {detail}")
++            except requests.RequestException as exc:
++                st.error(f"Location lookup is unavailable: {exc}. Use manual coordinates if necessary.")
++
++    lookup = st.session_state.get("station_location_lookup") or {}
++    if lookup.get("source") == location_names and lookup.get("locations"):
++        st.caption("Choose the correct location when names are ambiguous, then confirm.")
++        selections = []
++        for index, match in enumerate(lookup["locations"]):
++            candidates = match["candidates"]
++            selected_idx = st.selectbox(
++                f"{match['query']} — matching locations",
++                options=list(range(len(candidates))),
++                format_func=lambda idx, opts=candidates: (
++                    f"{opts[idx]['display']} "
++                    f"({opts[idx]['latitude']:.5f}, {opts[idx]['longitude']:.5f})"
++                ),
++                key=f"station_location_pick_{index}_{match['query']}",
++            )
++            selections.append(candidates[selected_idx])
++        selected_signature = [(row["location"], row["latitude"], row["longitude"]) for row in selections]
++        if st.button("Confirm selected locations", type="primary", key="confirm_station_locations"):
++            try:
++                canonical = confirmed_location_lines(selections)
++                parse_weather_locations(canonical)  # same rules used by /stations/onboard
++                st.session_state["station_location_confirmation"] = {
++                    "source": location_names,
++                    "signature": selected_signature,
++                    "canonical": canonical,
++                }
++            except (LocationLookupError, ValueError) as exc:
++                st.error(str(exc))
++        confirmed = st.session_state.get("station_location_confirmation") or {}
++        if (confirmed.get("source") == location_names
++                and confirmed.get("signature") == selected_signature):
++            weather_locations = confirmed["canonical"]
++            st.success(f"{len(selections)} locations confirmed. Weather coordinates are ready.")
++            st.dataframe([
++                {"Location": item["location"], "Latitude": item["latitude"], "Longitude": item["longitude"]}
++                for item in selections
++            ], hide_index=True, use_container_width=True)
++            st.map(pd.DataFrame({"lat": [row["latitude"] for row in selections],
++                                 "lon": [row["longitude"] for row in selections]}))
++        else:
++            st.info("Confirm the locations above before registering the station.")
++    elif location_names:
++        st.info("Click Find coordinates, select the correct places, and confirm before registration.")
++else:
++    weather_locations = st.text_area(
++        "Weather locations: Name, latitude, longitude (one per line)",
++        key="station_service_area_coordinates",
++        placeholder="Dortmund, 51.5136, 7.4653\nEssen, 51.4556, 7.0116",
++        help="Use when location search is unavailable or you have surveyed coordinates. "
++             "Add 1–12 points for the station service area.",
++    ).strip()
++    if weather_locations:
++        try:
++            preview_sites = parse_weather_locations(weather_locations)["sites"]
++            st.caption(f"{len(preview_sites)} valid locations will be saved with this station.")
++            st.map(pd.DataFrame({"lat": [row["latitude"] for row in preview_sites],
++                                 "lon": [row["longitude"] for row in preview_sites]}))
++        except ValueError as exc:
++            st.warning(f"Location input needs correction: {exc}")
++
+ with st.form("station_onboarding_form", clear_on_submit=False):
+     c1, c2 = st.columns(2)
+     with c1:
+@@ -127,13 +240,7 @@
+             "Timezone for timestamps without an offset", value="auto",
+             help="auto: UTC headers use UTC; other timestamps use Europe/Berlin. You may enter UTC or Europe/Berlin explicitly.",
+         ).strip()
+-        weather_locations = st.text_area(
+-            "Weather sampling locations (one per line)",
+-            value="",
+-            placeholder="Dortmund, 51.5136, 7.4653\nEssen, 51.4556, 7.0116",
+-            help="Name, latitude, longitude. Enter 1–12 locations covering the station service area. "
+-                 "Historical and forecast weather are downloaded automatically.",
+-        )
++        st.caption("Weather locations are selected and verified in the Service Area section above.")
+         numeric_locale = st.selectbox(
+             "Raw number format", ["de", "en"],
+             format_func=lambda code: "German / EU (1.234,56)" if code == "de" else "English / international (1,234.56)",
+@@ -188,7 +295,7 @@
+     elif stream_input == "csv_replay" and replay_start_date is None:
+         st.error("Select a replay start date.")
+     elif not weather_locations.strip():
+-        st.error("Enter at least one weather sampling location.")
++        st.error("Confirm service-area locations above, or enter valid manual coordinates.")
+     elif not selected_models:
+         st.error("Select at least one model component.")
+     elif "residual_anomaly" in selected_models and not {"demand_forecast", "solar_forecast", "wind_forecast"}.issubset(selected_models):

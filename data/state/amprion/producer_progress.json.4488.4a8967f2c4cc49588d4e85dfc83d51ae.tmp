@@ -1,0 +1,7 @@
+{
+  "station_id": "amprion",
+  "source_file": "C:\\Users\\hp\\Documents\\Nodes of Glory\\Performance upgrade\\data\\training\\amprion\\demand_test.csv",
+  "topic": "amprion-raw",
+  "last_acked_timestamp": "2026-10-03T14:45:00+00:00",
+  "updated_at_utc": "2026-11-18T18:21:06.312789+00:00"
+}

@@ -1,0 +1,302 @@
+--- a/backend/station_api.py
++++ b/backend/station_api.py
+@@ -27,6 +27,9 @@
+     parse_selected_models,
+ )
+ from src.ingestion.station_weather import FORECAST_COLUMNS, station_weather
++from src.ingestion.raw_station_loader import (
++    parse_weather_locations, spark_clean_raw_source, load_cleaned_station_csv,
++)
+ from src.models.forecast_weather import ForecastWeatherUnavailable
+ from src.models.forecast_contract import derive_forecast_contract
+ from src.models.evaluation_splits import archived_weather_history, forecast_split_origins
+@@ -219,14 +222,30 @@
+     featured_topic: str | None = Form(default=None),
+     hierarchy_path: str = Form(default=""),
+     replay_start_date: date | None = Form(default=None),
++    weather_locations: str = Form(default=""),
++    numeric_locale: str = Form(default="de"),
++    raw_sheet_name: str = Form(default=""),
++    raw_column_overrides: str = Form(default=""),
++    upload_mode: str = Form(default="auto"),
+ ):
+-    """Register a station from the multi-sheet Excel training workbook.
++    """Register a station from one raw CSV/Excel file, cleaned by Spark.
+ 
+     All four model components are enabled by default. ``selected_models`` may
+     contain a comma-separated or JSON-array list of component IDs, allowing
+     the onboarding UI to deselect each component independently.
+     """
+     key = _station_key(station_id)
++    # Direct Python callers may omit FastAPI Form values, leaving Form objects.
++    if not isinstance(upload_mode, str):
++        upload_mode = "auto"
++    if not isinstance(weather_locations, str):
++        weather_locations = ""
++    if not isinstance(numeric_locale, str):
++        numeric_locale = "de"
++    if not isinstance(raw_sheet_name, str):
++        raw_sheet_name = ""
++    if not isinstance(raw_column_overrides, str):
++        raw_column_overrides = ""
+     if not isinstance(stream_input, str):
+         stream_input = "csv_replay"
+     if stream_input not in {"csv_replay", "kafka"}:
+@@ -239,8 +258,17 @@
+         replay_start = pd.Timestamp(replay_start_date, tz="UTC")
+     elif not 0.10 <= stream_fraction <= 0.50:
+         raise HTTPException(status_code=422, detail="stream_fraction must be between 0.10 and 0.50.")
+-    if not file.filename or Path(file.filename).suffix.lower() not in {".xlsx", ".xlsm"}:
+-        raise HTTPException(status_code=422, detail="Please upload the Station Training Template as an .xlsx workbook.")
++    if not file.filename or Path(file.filename).suffix.lower() not in {".csv", ".xlsx", ".xlsm"}:
++        raise HTTPException(status_code=422, detail="Upload one raw CSV, XLSX or XLSM file.")
++    if upload_mode not in {"auto", "raw", "legacy_template"}:
++        raise HTTPException(status_code=422, detail="Unknown upload mode.")
++    if upload_mode == "auto":
++        # Preserve older API clients that still send the historical workbook.
++        # The customer-facing portal explicitly sends upload_mode=raw.
++        upload_mode = ("legacy_template" if file.filename.lower().endswith((".xlsx", ".xlsm"))
++                       and not weather_locations.strip() else "raw")
++    if numeric_locale not in {"de", "en"}:
++        raise HTTPException(status_code=422, detail="Number locale must be de or en.")
+ 
+     config = read_station_config()
+     stations = config.setdefault("stations", {})
+@@ -280,7 +308,7 @@
+     staging_dir = Path(tempfile.mkdtemp(prefix=f".{key}_onboard_", dir=station_parent))
+ 
+     try:
+-        upload_path = staging_dir / "source_upload.xlsx"
++        upload_path = staging_dir / ("source_upload" + Path(file.filename).suffix.lower())
+         size_bytes = 0
+         with upload_path.open("wb") as destination:
+             while True:
+@@ -288,21 +316,38 @@
+                 if not chunk:
+                     break
+                 size_bytes += len(chunk)
+-                if size_bytes > 100 * 1024 * 1024:
+-                    raise HTTPException(status_code=413, detail="Workbook exceeds the 100 MB onboarding upload limit.")
++                if size_bytes > 200 * 1024 * 1024:
++                    raise HTTPException(status_code=413, detail="Raw upload exceeds the 200 MB station onboarding limit.")
+                 destination.write(chunk)
+         if size_bytes == 0:
+             raise HTTPException(status_code=422, detail="The uploaded workbook is empty.")
+ 
+         try:
+-            datasets, workbook_diagnostics = await run_in_threadpool(
+-                load_station_workbook, upload_path,
+-                selected_models=selected,
+-                interval_minutes=interval_minutes,
+-                timestamp_format=timestamp_format,
+-                source_timezone=source_timezone or "UTC",
+-                location_from_workbook=True,
+-            )
++            if upload_mode == "raw":
++                weather_config = parse_weather_locations(weather_locations)
++                clean_path, raw_quality_report, processing_log = await run_in_threadpool(
++                    spark_clean_raw_source, upload_path, staging_dir, ROOT, key,
++                    source_timezone=source_timezone or "auto",
++                    interval_minutes=interval_minutes,
++                    number_locale=numeric_locale, sheet_name=raw_sheet_name,
++                    column_overrides=raw_column_overrides,
++                )
++                datasets, workbook_diagnostics = await run_in_threadpool(
++                    load_cleaned_station_csv, clean_path, selected, weather_config, interval_minutes,
++                )
++                workbook_diagnostics["raw_spark_quality"] = raw_quality_report
++                workbook_diagnostics["raw_spark_log"] = f"logs/{key}_raw_spark.log"
++            else:
++                if upload_path.suffix == ".csv":
++                    raise ValueError("Legacy template mode requires XLSX.")
++                datasets, workbook_diagnostics = await run_in_threadpool(
++                    load_station_workbook, upload_path,
++                    selected_models=selected,
++                    interval_minutes=interval_minutes,
++                    timestamp_format=timestamp_format,
++                    source_timezone=source_timezone or "UTC",
++                    location_from_workbook=True,
++                )
+             grid_offset = None
+             if parents:
+                 timestamp = pd.Timestamp(datasets["demand"]["utc_timestamp"].iloc[0])
+@@ -348,7 +393,7 @@
+         # Preserve the original workbook for traceability, and write normalized
+         # model-facing CSVs alongside it. The source remains separate from the
+         # generated training/stream partitions.
+-        source_filename = f"{key}_source.xlsx"
++        source_filename = f"{key}_source{upload_path.suffix}"
+         upload_path.rename(staging_dir / source_filename)
+ 
+         model_components: dict[str, dict[str, Any]] = {}
+@@ -481,9 +526,14 @@
+             "forecast_horizon_hours": forecast_contract["forecast_horizon_hours"],
+             "history_steps": history_steps,
+             "horizon_steps": horizon_steps,
+-            "source_timezone": source_timezone or "UTC",
++            "source_timezone": "UTC" if upload_mode == "raw" else (source_timezone or "UTC"),
+             "timestamp_format": timestamp_format,
+             "registered_source_file": file.filename,
++            "source_format": upload_mode,
++            "source_input_timezone": source_timezone or "auto",
++            **({"raw_spark_cleaned_file": f"data/raw/stations/{key}/{upload_path.stem}_cleaned.csv",
++                "raw_spark_quality_file": f"data/raw/stations/{key}/{upload_path.stem}_quality.json"}
++                if upload_mode == "raw" else {}),
+             "archived_source_file": f"data/raw/stations/{key}/{source_filename}",
+             "registered_file_size_bytes": int(size_bytes),
+             "model_data_diagnostics": workbook_diagnostics,
+@@ -596,6 +646,7 @@
+             "files": relative_files,
+             "model_row_counts": model_row_counts,
+             "workbook_diagnostics": workbook_diagnostics,
++            "raw_spark_quality": workbook_diagnostics.get("raw_spark_quality"),
+             "weather": weather_config,
+             "topics": topic_result,
+             "topics_ready": bool(topic_result),
+@@ -609,7 +660,7 @@
+     except HTTPException:
+         raise
+     except Exception as exc:
+-        raise HTTPException(status_code=422, detail=f"Station workbook onboarding failed: {exc}") from exc
++        raise HTTPException(status_code=422, detail=f"Station onboarding failed: {exc}") from exc
+     finally:
+         await file.close()
+         if staging_dir.exists():
+--- a/dashboard/pages/station_management.py
++++ b/dashboard/pages/station_management.py
+@@ -67,14 +67,17 @@
+ )
+ path_prefix = "\n".join(f"{level}: {name}" for level, name in parent_choices.get(parent_choice, []))
+ 
+-with st.expander("Excel upload guidance", expanded=False):
++with st.expander("Raw file onboarding — no template required", expanded=False):
+     st.markdown(
+-        "Fill in **Station Location** with a service-area name and coordinates. "
+-        "Use additional representative points for a large area. "
+-        "Upload timestamps, electricity readings and renewable capacity in the selected sheets. "
+-        "The application obtains weather from Open-Meteo."
++        "Upload one CSV or Excel file containing UTC/local timestamps, Demand, "
++        "Solar generation and capacity, and Wind Energy generation and capacity. "
++        "Extra columns are ignored. Spark detects the usual source header aliases, "
++        "repairs allowable gaps from earlier readings, and produces model-ready "
++        "training and replay datasets. Enter weather coordinates below; weather "
++        "is downloaded by the backend, not supplied in the raw file. "
++        "The attached Spark processor rejects more than 10% missing timestamp slots "
++        "or more than 10% missing target readings per Demand/Solar/Wind column."
+     )
+-st.link_button("Download station training Excel template", f"{api}/stations/template", use_container_width=False)
+ model_labels = {
+     "demand_forecast": "Demand forecasting",
+     "solar_forecast": "Solar forecasting",
+@@ -101,7 +104,11 @@
+                 "Replay start date (UTC)", value=None,
+                 help="Replay starts at 00:00 UTC. Earlier rows are used for model development. Choose the same date for stations you want to compare.",
+             )
+-        uploaded = st.file_uploader("Historical station workbook", type=["xlsx", "xlsm"], key="station_workbook_upload")
++        uploaded = st.file_uploader(
++            "Customer raw data (single CSV or Excel file)",
++            type=["csv", "xlsx", "xlsm"], key="station_workbook_upload",
++            help="No fixed template, no separate training/streaming sheets; extra columns are ignored.",
++        )
+     with c2:
+         st.markdown("**Timestamp configuration**")
+         format_options = {
+@@ -117,9 +124,31 @@
+         if timestamp_format == "__custom__":
+             timestamp_format = st.text_input("Python datetime format", value="%Y-%m-%d %H:%M:%S").strip()
+         source_timezone = st.text_input(
+-            "Timezone for timestamps without an offset", value="UTC",
+-            help="Example: Europe/Berlin; offset-aware timestamps are normalized to UTC.",
++            "Timezone for timestamps without an offset", value="auto",
++            help="auto: UTC headers use UTC; other timestamps use Europe/Berlin. You may enter UTC or Europe/Berlin explicitly.",
+         ).strip()
++        weather_locations = st.text_area(
++            "Weather sampling locations (one per line)",
++            value="",
++            placeholder="Dortmund, 51.5136, 7.4653\nEssen, 51.4556, 7.0116",
++            help="Name, latitude, longitude. Enter 1–12 locations covering the station service area. "
++                 "Historical and forecast weather are downloaded automatically.",
++        )
++        numeric_locale = st.selectbox(
++            "Raw number format", ["de", "en"],
++            format_func=lambda code: "German / EU (1.234,56)" if code == "de" else "English / international (1,234.56)",
++        )
++        with st.expander("Optional raw-column mapping", expanded=False):
++            raw_column_overrides = st.text_area(
++                "Source column overrides",
++                placeholder="timestamp=Measured at\ndemand=Grid demand [MWh]\nwind_mw=Wind capacity (MW)",
++                help="One canonical_key=actual source heading per line. Keys: timestamp, demand, "
++                     "solar_mwh, solar_mw, wind_mwh, wind_mw. Leave blank for automatic detection.",
++            )
++            raw_sheet_name = st.text_input(
++                "Excel worksheet name (optional)",
++                value="", help="Leave empty to use 50 hertz sheet if present, otherwise first sheet.",
++            )
+         interval_minutes = int(st.number_input(
+             "Source observation interval (minutes)", min_value=5, max_value=1440, value=15,
+             help="The current solar/wind and anomaly trainers require 15-minute observations.",
+@@ -151,13 +180,15 @@
+         raw_topic = st.text_input("Raw topic (automatic if empty)", placeholder="tennet-raw")
+     with topic_col2:
+         featured_topic = st.text_input("Featured topic (automatic if empty)", placeholder="tennet-featured")
+-    submitted = st.form_submit_button("Validate workbook and register station", type="primary")
++    submitted = st.form_submit_button("Process raw file and register station", type="primary")
+ 
+ if submitted:
+     if not station_id or uploaded is None:
+-        st.error("Enter a station ID and upload the Excel workbook.")
++        st.error("Enter a station ID and upload a raw CSV/Excel file.")
+     elif stream_input == "csv_replay" and replay_start_date is None:
+         st.error("Select a replay start date.")
++    elif not weather_locations.strip():
++        st.error("Enter at least one weather sampling location.")
+     elif not selected_models:
+         st.error("Select at least one model component.")
+     elif "residual_anomaly" in selected_models and not {"demand_forecast", "solar_forecast", "wind_forecast"}.issubset(selected_models):
+@@ -165,6 +196,9 @@
+     elif interval_minutes != 15 and any(m != "demand_forecast" for m in selected_models):
+         st.error("Solar, wind and anomaly training currently require 15-minute data.")
+     else:
++        st.info("Spark is validating and cleaning the raw file. Registration then downloads weather, "
++                "prepares training/replay datasets and queues model training. "
++                "For large files, see logs/<station-id>_raw_spark.log.")
+         try:
+             result = api_post(
+                 "/stations/onboard",
+@@ -181,9 +215,16 @@
+                     "residual_demand_unit": residual_demand_unit,
+                     "raw_topic": raw_topic.strip(),
+                     "featured_topic": featured_topic.strip(),
++                    "weather_locations": weather_locations,
++                    "numeric_locale": numeric_locale,
++                    "raw_sheet_name": raw_sheet_name,
++                    "raw_column_overrides": raw_column_overrides,
++                    "upload_mode": "raw",
+                 },
+-                files={"file": (uploaded.name, uploaded.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+-                timeout=(10, 900),
++                files={"file": (uploaded.name, uploaded.getvalue(),
++                          "text/csv" if uploaded.name.lower().endswith(".csv") else
++                          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
++                timeout=(20, 3600),
+             )
+             st.session_state["registered_station_notice"] = result
+             st.session_state["registered_station_selection"] = result["station"]
+@@ -199,7 +240,16 @@
+ 
+ notice = st.session_state.pop("registered_station_notice", None)
+ if notice:
+-    st.success(f"{notice['station']} registered. Initial training is queued.")
++    st.success(f"{notice['station']} registered from raw data. Initial training is queued.")
++    quality = notice.get("raw_spark_quality") or {}
++    if quality:
++        st.caption(
++            f"Spark cleaned {quality.get('rows', 0):,} UTC intervals "
++            f"· missing timestamp slots {quality.get('missing_timestamp_pct', '—')}% "
++            f"· duplicate source rows {quality.get('duplicate_rows_removed', 0)}"
++        )
++        if quality.get("warnings"):
++            st.warning("Data-quality notes: " + "; ".join(quality["warnings"][:4]))
+     if notice.get("replay_start_date"):
+         st.caption(f"Replay starts {notice['replay_start_date']} at 00:00 UTC.")
+     if notice.get("topic_warning"):
