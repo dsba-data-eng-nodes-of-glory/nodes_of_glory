@@ -1,40 +1,75 @@
-# Nodes of Glory — Latest Registration Only Hotfix
+# Nodes of Glory
 
-**Baseline:** Apply after `Nodes_of_Glory_Data_Quality_Approval_Patch.zip` and the earlier location/background-registration patches. Does not touch training, Spark, Kafka, station configs, datasets, models or checkpoints.
+Electricity demand and renewable-generation forecasting, residual-load spike detection, and station pipeline monitoring.
 
-## Changes
+Repository: <https://github.com/dsba-data-eng-nodes-of-glory/nodes_of_glory>
 
-- Station Management no longer shows a dropdown of historical completed/interrupted registration jobs. It requests **one newest job** and shows only its progress.
-- On page navigation, an active latest job and pending quality confirmation remain visible. Its completion or failure stays visible in the current browser session until the operator clicks **Dismiss latest result**.
-- On a new browser session, **stale completed, failed, cancelled, or interrupted jobs do not reappear** in the progress panel. They remain stored in the backend database for diagnosis, without being deleted.
-- The registration reminder on other dashboard pages also checks only the newest job; older pending/failed jobs no longer appear in the customer-facing banner.
-- If two jobs have the same creation second, the API picks the most recently inserted one.
+## Start here
 
-**Important:** This is a *display-only* change. Older registration jobs are not cancelled; any backend jobs already running continue, and their audit records remain. Only the newest is visible in the customer UI. Do not submit multiple parallel jobs if you need to approve each separately.
+- [Local setup and changes for this Mac](docs/LOCAL_SETUP.md): environment, launch commands, ports and troubleshooting.
+- [Station data and operations](docs/OPERATIONS.md): inputs, Spark cleaning, quality approval, replay and monitoring.
+- [Random Forest improvement](docs/random_forest_day_only.md): previous-day feature, compatibility and earlier validation evidence.
 
-## Safe installation (Windows)
+Current dashboard: <http://127.0.0.1:8509/>. API documentation: <http://127.0.0.1:8007/docs>. These addresses work while the services run on this computer.
 
-1. Stop Streamlit and FastAPI; back up your project folder.
-2. Extract this ZIP anywhere.
-3. In a command prompt, run:
+## Project workflow
 
-```bat
-python preflight_and_apply.py --project "C:\Users\hp\Documents\Nodes of Glory\Performance upgrade" --check
+1. **Register data.** Upload a station CSV/Excel file and specify its time zone, interval, units, replay date and weather sampling locations.
+2. **Prepare data with Spark.** Normalize timestamps to UTC, reconcile duplicates, construct the interval grid, apply past-only repairs and write quality diagnostics.
+3. **Review and enrich.** Approve accepted source data in the dashboard. The backend aligns weather and prepares station-specific training/replay files.
+4. **Train and evaluate.** Fit candidates using earlier observations and chronological validation; replay-configured stations also have a held-out test partition where supported by the component trainer.
+5. **Stream and predict.** A CSV producer publishes to the station's raw Kafka topic. Spark consumes it and publishes featured events. The predictor consumes featured events, builds model inputs, forecasts and persists results. Invalid events can go to the dead-letter topic.
+6. **Monitor.** FastAPI serves stored observations, forecasts and residual-load assessments to Streamlit. Pipeline controls start/stop workers; model controls compare and deploy candidate versions.
+
+The local setup replays historical files, rather than connecting to a live grid feed. At a 15-minute interval, the standard demand contract is seven days of history (672 observations) and the next 24 hours (96 targets). Other supported intervals derive their step counts from these durations.
+
+## Models
+
+| Component | Available approaches | Output |
+| --- | --- | --- |
+| Demand forecasting | Dense NN, LSTM, Random Forest, GBT, XGBoost | Demand forecast in MW |
+| Solar forecasting | Dense NN, LSTM, Random Forest, GBT, XGBoost | Solar-generation forecast |
+| Wind forecasting | Dense NN, LSTM, Random Forest, GBT, XGBoost | Wind-generation forecast |
+| Residual-load detection | Dense autoencoder with statistical/ramp screening | Anomaly assessments and alerts |
+
+Forecast regressors use supervised learning: the label is observed demand or generation at the target timestamp. Autoencoder reconstruction is unsupervised; the residual component is not a supervised Random Forest spike classifier. Residual load is demand minus solar and wind generation.
+
+**Random Forest port:** new *demand* RF training uses the original tabular inputs plus `demand_target_previous_day`: 37 inputs at 15-minute resolution. The extra target-specific weekly input is omitted; original weekly lags remain. Other model/component inputs are unchanged. Feature schema `electricity_tabular_v3` identifies this layout and is separate from experiment version labels such as v4. Saved models retain their feature layouts until retrained and explicitly deployed.
+
+## Data and configuration
+
+| Location | Purpose |
+| --- | --- |
+| `config/stations.yaml` | Source paths, hierarchy, topics, weather, deployed components |
+| `config/model.yaml` | History/horizon durations and inference settings |
+| `config/algorithm_configs.yaml` | Algorithm parameters and sampling budgets |
+| `config/kafka.yaml`, `config/spark.yaml` | Broker, processing and checkpoint settings |
+| `config/storage.yaml` | CSV/Cassandra backend, quality and observability |
+| `data/raw/stations/<station>/` | Uploaded sources, Spark audits and generated datasets |
+| `data/training/` | Training data for stations using this older layout |
+| `data/processed/stations/<station>/` | CSV-mode outputs and local assessment stores |
+| `data/state/`, `checkpoints/` | Recovery cursors, job state and Spark progress |
+| `models/<station>/experiments/<id>/` | Candidate artifacts and metadata |
+| `logs/` | Worker and processing logs |
+
+Station-configured file paths are the source of truth; multiple layouts exist. Dataset attribution to OPSD remains a **placeholder pending verification of the actual station files**. Confirm provenance, units, coverage and licensing before publishing results/data.
+
+## Evaluate a new demand Random Forest
+
+1. In **Model Management → Configure & Retrain**, select the station, Demand component and Random Forest.
+2. Confirm the training source, parameters and evaluation budget; submit a candidate.
+3. Inspect its `metadata.json`: expect schema `electricity_tabular_v3`, `demand_target_previous_day` in `feature_names`, and no `demand_target_previous_week`.
+4. Compare MAE, RMSE, WAPE, training time and latency with an original RF on the same source, split and sampled forecast origins. Lower error is better; WAPE is not classification accuracy.
+5. Deploy the selected candidate in Model Management and restart the affected station pipeline if required by deployment status. Training alone does not replace an active model.
+
+This port includes no new production training or deployment. Earlier feature-selection results are in the [RF note](docs/random_forest_day_only.md).
+
+## Focused verification
+
+From the repository root, using the project environment:
+
+```bash
+python -m pytest -q tests/test_target_demand_features.py tests/test_tabular_algorithm_scope.py tests/test_train_origin_sampling.py tests/test_dynamic_interval.py
 ```
 
-4. If it prints `Preflight PASSED`, run:
-
-```bat
-python preflight_and_apply.py --project "C:\Users\hp\Documents\Nodes of Glory\Performance upgrade" --apply
-```
-
-5. Restart FastAPI and Streamlit.
-
-The installer refuses to overwrite files that differ from the **Data Quality Approval** patch baseline. If you have made local changes, inspect the included diff and merge manually rather than forcing a replacement.
-
-## Verification
-
-- `python -m py_compile overlay/dashboard/pages/station_management.py overlay/dashboard/ui.py overlay/backend/onboarding_jobs.py`
-- `python -m pytest -q tests/test_latest_only.py` — 6 focused tests (no Spark or Streamlit installation needed).
-
-Not tested with the user's running Windows Streamlit/FastAPI environment.
+Coverage includes alignment, future-label isolation, RF-only routing, saved-model compatibility, chronological splits, weather and NN blending. This is not a full Kafka/Spark rehearsal. Historical ZIP-patch READMEs have been consolidated into the guides above; model checkpoint provenance documentation is retained.

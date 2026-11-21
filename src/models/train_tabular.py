@@ -23,7 +23,8 @@ from src.models.evaluation_splits import archived_weather_history, forecast_spli
 from src.models.model_registry import next_version, upsert_experiment, utc_now
 from src.models.forecast_contract import station_forecast_contract
 from src.models.tabular_forecasting import (
-    FEATURE_SCHEMA,
+    DAY_ONLY_FEATURE_SCHEMA,
+    LEGACY_FEATURE_SCHEMA,
     apply_demand_blend,
     weekly_demand_baseline,
     build_training_examples,
@@ -112,6 +113,8 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
     overall_started = time.perf_counter()
     station = str(config["station"])
     algorithm = str(config["algorithm"])
+    # Target-aligned demand is an RF-only input; preserve other algorithms' contract.
+    feature_schema = DAY_ONLY_FEATURE_SCHEMA if algorithm == "random_forest" else LEGACY_FEATURE_SCHEMA
     experiment_id = str(config["experiment_id"])
     parameters = json_safe_parameters(dict(config.get("parameters") or {}))
     training_options = dict(config.get("training_options") or {})
@@ -164,10 +167,12 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
         ])
 
     x_train, y_train, train_origin_ids = build_training_examples(
-        frame, train_origins, history_steps, horizon_steps, interval_minutes, use_forecast_weather=managed
+        frame, train_origins, history_steps, horizon_steps, interval_minutes,
+        use_forecast_weather=managed, feature_schema=feature_schema,
     )
     x_valid, y_valid, valid_origin_ids = build_training_examples(
-        frame, validation_origins, history_steps, horizon_steps, interval_minutes, use_forecast_weather=managed
+        frame, validation_origins, history_steps, horizon_steps, interval_minutes,
+        use_forecast_weather=managed, feature_schema=feature_schema,
     )
     feature_names = list(x_train.columns)
     x_valid = x_valid.reindex(columns=feature_names)
@@ -215,6 +220,7 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
         test_origins = sample_origins(origin_groups[2], max_eval)
         x_test, y_test, _ = build_training_examples(
             frame, test_origins, history_steps, horizon_steps, interval_minutes, use_forecast_weather=managed,
+            feature_schema=feature_schema,
         )
         x_test = x_test.reindex(columns=feature_names)
         test_predicted = estimator.predict(x_test.to_numpy(dtype=np.float32))
@@ -251,7 +257,7 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
         "version": version,
         "artifact_path": artifact_path.relative_to(ROOT).as_posix(),
         "metadata_path": metadata_path.relative_to(ROOT).as_posix(),
-        "feature_schema": FEATURE_SCHEMA,
+        "feature_schema": feature_schema,
         "feature_names": feature_names,
         "history_steps": history_steps,
         "horizon_steps": horizon_steps,
@@ -296,7 +302,7 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
         "status": "candidate",
         "artifact_path": metadata["artifact_path"],
         "metadata_path": metadata["metadata_path"],
-        "feature_schema": FEATURE_SCHEMA,
+        "feature_schema": feature_schema,
         "history_steps": history_steps,
         "horizon_steps": horizon_steps,
         "interval_minutes": interval_minutes,

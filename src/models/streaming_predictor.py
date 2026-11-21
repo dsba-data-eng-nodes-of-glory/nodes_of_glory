@@ -58,7 +58,9 @@ from src.storage.forecast_store import append_actuals, append_forecasts, storage
 from src.quality.validator import validate_event, quality_event
 from src.quality.event_store import record_quality_event
 from src.observability import metrics
-from src.models.tabular_forecasting import apply_demand_blend, build_origin_features, weekly_demand_baseline
+from src.models.tabular_forecasting import (
+    LEGACY_FEATURE_SCHEMA, apply_demand_blend, build_origin_features, weekly_demand_baseline,
+)
 from src.ingestion.station_weather import FORECAST_WEATHER_MODE, StationWeather, live_origin, station_weather, utc_index
 from src.models.forecast_weather import ForecastWeatherUnavailable, select_forecast_horizon
 
@@ -436,7 +438,10 @@ def generate_forecast(
 
     if algorithm in {"random_forest", "gbt", "xgboost"} or (algorithm == "dense_nn" and checkpoint.get("feature_schema") == "electricity_tabular_v1"):
         history_frame = pd.DataFrame(history)
-        features = build_origin_features(history_frame, future_ts, interval_minutes, temperatures)
+        features = build_origin_features(
+            history_frame, future_ts, interval_minutes, temperatures,
+            feature_schema=checkpoint.get("feature_schema", LEGACY_FEATURE_SCHEMA),
+        )
         feature_names = checkpoint.get("feature_names", list(features.columns))
         missing = set(feature_names) - set(features.columns)
         if missing:
